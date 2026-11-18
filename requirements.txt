@@ -1,0 +1,7 @@
+oracledb
+pandas
+requests
+sqlglot
+networkx
+streamlit
+openpyxl

@@ -1,0 +1,17 @@
+# Kişisel / kuruma özel ayarlar ve gizli bilgiler
+ayarlar.py
+ibthink_anahtar.txt
+*_anahtar.txt
+
+# Bilgi tabanı ve çıktılar (kurum verisi içerir)
+kb/
+*.sqlite
+*.sqlite-*
+*.jsonl
+*.csv
+*.xlsx
+
+# Çalışma dosyaları
+.ajan_pid
+__pycache__/
+*.pyc
