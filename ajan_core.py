@@ -20,6 +20,7 @@ import sqlite3
 import ssl
 import sys
 import tempfile
+import threading
 import time
 
 import pandas as pd
@@ -43,6 +44,7 @@ SHOW_ROWS = 5000               # ekranda tutulacak en fazla satır (sql_calistir
 MODEL_ROWS = 25                # modele gösterilen örnek satır sayısı
 QUERY_TIMEOUT_MS = 180_000     # tek sorgu zaman aşımı
 EXPORT_MAX_ROWS = 500_000      # "tüm sonucu Excel'e" için üst sınır
+EVAL_MAX_ROWS = 50_000         # ölçümde altın SQL ve ajan SQL'i için ortak üst sınır
 HEAVY_COST = 5_000_000         # EXPLAIN PLAN maliyeti bunu aşarsa uyarı
 HEAVY_ROWS = 50_000_000        # tahmini satır sayısı bunu aşarsa uyarı
 # ======================================================================
@@ -51,6 +53,20 @@ KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ibthink_ana
 KB_PATH = os.path.join(kb.KB_DIR, "kb.sqlite")
 LOG_PATH = os.path.join(kb.KB_DIR, "ajan_log.jsonl")
 PAUSE_TOOLS = {"plan_onayla", "kullaniciya_sor"}
+_HTTP = requests.Session()
+_DB_LOCK = threading.Lock()
+
+_TR_FOLD_MAP = str.maketrans({
+    "İ": "i", "I": "i", "ı": "i", "Ş": "s", "ş": "s", "Ğ": "g", "ğ": "g",
+    "Ü": "u", "ü": "u", "Ö": "o", "ö": "o", "Ç": "c", "ç": "c",
+})
+
+
+def tr_fold(text):
+    """Türkçe büyük/küçük harf ve aksan farkını kaldıran arama katlaması (SQLite TR_FOLD için)."""
+    if text is None:
+        return ""
+    return str(text).translate(_TR_FOLD_MAP).lower()
 
 
 # ------------------------------- LLM -------------------------------
@@ -109,7 +125,7 @@ def llm_chat(messages, tools=None, no_think=False):
     last = ""
     for attempt in range(5):
         try:
-            r = requests.post(LLM_URL, json=payload, headers=headers, timeout=LLM_TIMEOUT, verify=VERIFY)
+            r = _HTTP.post(LLM_URL, json=payload, headers=headers, timeout=LLM_TIMEOUT, verify=VERIFY)
         except requests.RequestException as e:
             last = f"{type(e).__name__}: {str(e)[:200]}"
             time.sleep(10 * (attempt + 1))
@@ -133,13 +149,28 @@ def llm_chat(messages, tools=None, no_think=False):
 # ---------------------------- Bilgi tabanı ----------------------------
 VERIFIED_SQL = """CREATE TABLE IF NOT EXISTS verified_queries(id INTEGER PRIMARY KEY, soru TEXT, sql TEXT,
     aciklama TEXT, tablolar TEXT, created_at TEXT)"""
+FEEDBACK_SQL = """CREATE TABLE IF NOT EXISTS feedback_log(id INTEGER PRIMARY KEY, soru TEXT, sql TEXT,
+    sonuc TEXT, notlar TEXT, created_at TEXT)"""
+
+
+def init_db(db):
+    """SQLite bağlantısına Türkçe arama fonksiyonunu, eşzamanlılık ayarlarını ve ajan tablolarını ekler."""
+    db.create_function("TR_FOLD", 1, tr_fold)
+    try:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA busy_timeout=15000")
+    except sqlite3.Error:
+        pass
+    with _DB_LOCK:
+        db.execute(VERIFIED_SQL)
+        db.execute(FEEDBACK_SQL)
+        db.commit()
+    return db
 
 
 def open_kb():
-    db = sqlite3.connect(KB_PATH, check_same_thread=False)
-    db.execute(VERIFIED_SQL)
-    db.commit()
-    return db
+    db = sqlite3.connect(KB_PATH, timeout=30.0, check_same_thread=False)
+    return init_db(db)
 
 
 def has_table(db, name):
@@ -164,7 +195,8 @@ def kb_stats(db):
     out = {"tablo": q("SELECT COUNT(*) FROM objects"), "kullanilan": q("SELECT COUNT(*) FROM v_usage"),
            "join": q("SELECT COUNT(*) FROM join_edges") if has_table(db, "join_edges") else 0,
            "kart": q("SELECT COUNT(*) FROM table_cards WHERE status='ok'") if has_table(db, "table_cards") else 0,
-           "onayli_sorgu": q("SELECT COUNT(*) FROM verified_queries")}
+           "onayli_sorgu": q("SELECT COUNT(*) FROM verified_queries"),
+           "geri_bildirim": q("SELECT COUNT(*) FROM feedback_log") if has_table(db, "feedback_log") else 0}
     return out
 
 
@@ -284,8 +316,9 @@ TOOLS = [
 class Ctx:
     """Araçların ihtiyaç duyduğu bağlantılar ve oturum durumu."""
 
-    def __init__(self, db, conn=None):
+    def __init__(self, db, conn=None, use_verified=True):
         self.db, self.conn = db, conn
+        self.use_verified = use_verified
         self.last_df, self.last_sql, self.last_more = None, None, False
         self._graph = None
 
@@ -327,18 +360,18 @@ class Ctx:
         scores = {}
         has_cards = has_table(db, "table_cards")
         for t in terms:
-            like = f"%{t.upper()}%"
+            tf = tr_fold(t)
+            like = f"%{tf}%"
             for o, n, cmt, nf in db.execute("""
                     SELECT o.owner, o.name, o.comments, COALESCE(u.n_files,0) FROM objects o
                     LEFT JOIN v_usage u ON u.owner=o.owner AND u.table_name=o.name
-                    WHERE UPPER(o.name) LIKE ? OR UPPER(COALESCE(o.comments,'')) LIKE ?
+                    WHERE TR_FOLD(o.name) LIKE ? OR TR_FOLD(COALESCE(o.comments,'')) LIKE ?
                     ORDER BY COALESCE(u.n_files,0) DESC LIMIT 60""", (like, like)):
                 k = (o, n)
-                scores[k] = scores.get(k, 0) + (2 if t.upper() in n else 1)
+                scores[k] = scores.get(k, 0) + (2 if tf in tr_fold(n) else 1)
             if has_cards:
                 for o, n in db.execute("""SELECT owner, table_name FROM table_cards WHERE status='ok'
-                                          AND (card LIKE ? OR card LIKE ? OR card LIKE ?)""",
-                                       (f"%{t}%", f"%{t.lower()}%", f"%{t.capitalize()}%")):
+                                          AND TR_FOLD(card) LIKE ?""", (like,)):
                     scores[(o, n)] = scores.get((o, n), 0) + 1.5
         personal = re.compile(kb.PERSONAL_REGEX)
         ranked = []
@@ -363,14 +396,15 @@ class Ctx:
         if not ranked:
             out.append("- (eşleşen tablo yok; başka kelimeler dene)")
 
-        ver = []
-        for t in terms:
-            ver += db.execute("SELECT id, soru, sql FROM verified_queries WHERE soru LIKE ? LIMIT 3",
-                              (f"%{t}%",)).fetchall()
-        if ver:
-            out.append("\nEKİBİN ONAYLADIĞI SORGULAR (öncelikle bunları örnek al):")
-            for _, soru, sql in {v[0]: v for v in ver}.values():
-                out.append(f"- Soru: {soru}\n  SQL: {short(sql, 900)}")
+        if self.use_verified:
+            ver = []
+            for t in terms:
+                ver += db.execute("SELECT id, soru, sql FROM verified_queries WHERE TR_FOLD(soru) LIKE ? LIMIT 3",
+                                  (f"%{tr_fold(t)}%",)).fetchall()
+            if ver:
+                out.append("\nEKİBİN ONAYLADIĞI SORGULAR (öncelikle bunları örnek al):")
+                for _, soru, sql in {v[0]: v for v in ver}.values():
+                    out.append(f"- Soru: {soru}\n  SQL: {short(sql, 900)}")
 
         if has_table(db, "snippets_fts"):
             q = " OR ".join('"' + t.replace('"', "") + '"' for t in terms)
@@ -389,8 +423,8 @@ class Ctx:
 
         fams = []
         for t in terms:
-            fams += db.execute("SELECT owner, family, n_tables, last_table FROM families WHERE family LIKE ? LIMIT 3",
-                               (f"%{t.upper()}%",)).fetchall()
+            fams += db.execute("SELECT owner, family, n_tables, last_table FROM families WHERE TR_FOLD(family) LIKE ? LIMIT 3",
+                               (f"%{tr_fold(t)}%",)).fetchall()
         if fams:
             out.append("\nDÖNEMSEL TABLO AİLELERİ:")
             for o, f, n, last in dict.fromkeys(fams):
@@ -722,9 +756,45 @@ def log(sess, ctx):
 
 def save_verified(db, soru, sql, aciklama=""):
     tablolar = ", ".join(sorted(set(re.findall(r"\b([A-Z][A-Z0-9_$#]*\.[A-Z][A-Z0-9_$#]*)\b", (sql or "").upper()))))
-    db.execute("INSERT INTO verified_queries(soru, sql, aciklama, tablolar, created_at) VALUES(?,?,?,?,?)",
-               (soru, sql, aciklama, tablolar, dt.datetime.now().isoformat(timespec="seconds")))
-    db.commit()
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    with _DB_LOCK:
+        db.execute("INSERT INTO verified_queries(soru, sql, aciklama, tablolar, created_at) VALUES(?,?,?,?,?)",
+                   (soru, sql, aciklama, tablolar, now))
+        db.execute("INSERT INTO feedback_log(soru, sql, sonuc, notlar, created_at) VALUES(?,?,?,?,?)",
+                   (soru, sql, "dogru", aciklama, now))
+        db.commit()
+
+
+def save_feedback(db, soru, sql="", sonuc="yanlis", notlar=""):
+    """Kullanıcının 👍/👎 geri bildirimini opsiyonel notuyla SQLite feedback_log tablosuna kaydeder."""
+    with _DB_LOCK:
+        db.execute(FEEDBACK_SQL)
+        db.execute("INSERT INTO feedback_log(soru, sql, sonuc, notlar, created_at) VALUES(?,?,?,?,?)",
+                   (soru, sql or "", sonuc, (notlar or "").strip(), dt.datetime.now().isoformat(timespec="seconds")))
+        db.commit()
+
+
+def list_feedback(db, sonuc=None, limit=50):
+    with _DB_LOCK:
+        db.execute(FEEDBACK_SQL)
+    if sonuc:
+        return pd.read_sql_query(
+            "SELECT created_at AS tarih, sonuc, soru, notlar, sql FROM feedback_log WHERE sonuc=? ORDER BY id DESC LIMIT ?",
+            db, params=(sonuc, limit))
+    return pd.read_sql_query(
+        "SELECT created_at AS tarih, sonuc, soru, notlar, sql FROM feedback_log ORDER BY id DESC LIMIT ?",
+        db, params=(limit,))
+
+
+def export_verified_excel(db):
+    """verified_queries tablosunu ölçüm sekmesine doğrudan yüklenebilecek olcum_seti.xlsx formatında döner."""
+    import io
+    df = pd.read_sql_query(
+        "SELECT soru, sql AS dogru_sql, COALESCE(aciklama, '') AS kategori FROM verified_queries ORDER BY id", db)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False)
+    return buf.getvalue(), len(df)
 
 
 def to_excel(df, soru="", sql=""):
@@ -803,42 +873,55 @@ def table_hit(db, gold_sql, pred_sql):
     return round(len(gt & pt) / len(gt), 2) if gt else None
 
 
-def evaluate(db, conn, rows, on_progress=None):
-    """rows: [(soru, dogru_sql, kategori)]. Sonuçlar eval_runs tablosuna da kaydedilir (sürümleri karşılaştırmak için)."""
-    db.execute(EVAL_SQL)
+def evaluate(db, conn, rows, on_progress=None, eval_max_rows=EVAL_MAX_ROWS, use_verified=False):
+    """rows: [(soru, dogru_sql, kategori)]. Sonuçlar eval_runs tablosuna da kaydedilir (sürümleri karşılaştırmak için).
+
+    Hem doğru SQL hem ajanın SQL'i aynı satır üst sınırıyla (eval_max_rows) karşılaştırılır; varsayılan olarak
+    use_verified=False ile ölçüm sırasında onaylı sorgu sızıntısı (data leakage) engellenir.
+    """
+    with _DB_LOCK:
+        db.execute(EVAL_SQL)
+        db.commit()
     run_id = dt.datetime.now().strftime("%Y%m%d_%H%M")
     results = []
     for i, row in enumerate(rows, 1):
         soru, gold, kategori = (list(row) + [""])[:3]
-        ctx, sess = Ctx(db, conn), Session(soru)
+        ctx, sess = Ctx(db, conn, use_verified=use_verified), Session(soru)
         state = run(sess, ctx, auto_approve=True)
         pred_sql = (sess.result or {}).get("sql", "")
         rec = {"kategori": kategori or "", "soru": soru, "sonuc": "HATA", "f1": 0.0, "tablo_isabet": None,
                "eksik_satir": None, "fazla_satir": None, "adim": sess.n_llm,
                "sure_sn": round(time.time() - sess.started, 1), "ajan_sql": pred_sql, "notlar": ""}
         try:
-            gdf, _ = fetch_df(conn, check_select(gold), 50000)
+            gdf, g_more = fetch_df(conn, check_select(gold), eval_max_rows)
             rec["tablo_isabet"] = table_hit(db, gold, pred_sql)
             if state != "done" or ctx.last_df is None:
                 rec["notlar"] = sess.error or "ajan sorgu çalıştırmadı"
             else:
+                pdf, p_more = ctx.last_df, False
+                if ctx.last_more and ctx.last_sql and eval_max_rows > SHOW_ROWS:
+                    pdf, p_more = fetch_df(conn, check_select(ctx.last_sql), eval_max_rows)
                 (rec["sonuc"], rec["f1"], rec["eksik_satir"], rec["fazla_satir"],
-                 rec["notlar"]) = compare_results(gdf, ctx.last_df)
+                 rec["notlar"]) = compare_results(gdf, pdf)
+                if g_more or p_more:
+                    rec["notlar"] += f" (uyarı: >{eval_max_rows:,} satırda kesildi)"
         except Exception as e:
             rec["notlar"] = f"doğru SQL çalışmadı: {str(e)[:150]}"
         results.append(rec)
-        db.execute("INSERT INTO eval_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                   (run_id, dt.datetime.now().isoformat(timespec="seconds"), rec["kategori"], soru, rec["sonuc"],
-                    rec["f1"], rec["tablo_isabet"], rec["eksik_satir"], rec["fazla_satir"], rec["adim"],
-                    rec["sure_sn"], pred_sql, rec["notlar"]))
-        db.commit()
+        with _DB_LOCK:
+            db.execute("INSERT INTO eval_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (run_id, dt.datetime.now().isoformat(timespec="seconds"), rec["kategori"], soru, rec["sonuc"],
+                        rec["f1"], rec["tablo_isabet"], rec["eksik_satir"], rec["fazla_satir"], rec["adim"],
+                        rec["sure_sn"], pred_sql, rec["notlar"]))
+            db.commit()
         if on_progress:
             on_progress(i, len(rows), rec)
     return run_id, pd.DataFrame(results)
 
 
 def eval_history(db):
-    db.execute(EVAL_SQL)
+    with _DB_LOCK:
+        db.execute(EVAL_SQL)
     return pd.read_sql_query("""SELECT run_id AS olcum, COUNT(*) AS soru, SUM(sonuc='DOĞRU') AS dogru,
                                 SUM(sonuc='İNCELE') AS incele, SUM(sonuc='YANLIŞ') AS yanlis, SUM(sonuc='HATA') AS hata,
                                 ROUND(AVG(f1),3) AS ort_f1, ROUND(AVG(tablo_isabet),2) AS tablo_isabet,

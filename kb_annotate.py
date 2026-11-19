@@ -36,7 +36,7 @@ import kb_builder as kb  # noqa: E402  (KB_DIR, dosya okuma ve SQL çıkarma fon
 
 # =============================== AYARLAR ===============================
 LLM_URL = kb.LLM_URL             # ayarlar.py'den gelir
-LLM_API_KEY = ""
+LLM_API_KEY = ""                 # boş bırak: IBTHINK_API_KEY ortam değişkeni veya ibthink_anahtar.txt okunur
 LLM_MODEL = kb.LLM_MODEL
 LLM_VERIFY_SSL = "windows"
 LLM_TIMEOUT = 600
@@ -55,6 +55,7 @@ MAX_COLUMNS = 250            # tablo kartında gösterilecek en fazla kolon
 MAX_EXAMPLE_SQL = 4          # tablo kartı için örnek sorgu sayısı
 PROMPT_VERSION = "v3"        # prompt değişince artır: kartlar yeniden yazılır
 ONAYLI_BILGILER = "onayli_bilgiler.txt"   # KB_DIR içinde; ekibin kesinleştirdiği bilgiler (her satır bir bilgi)
+KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ibthink_anahtar.txt")
 # ======================================================================
 
 try:
@@ -79,6 +80,16 @@ def resolve_ssl_verify(setting):
 
 VERIFY = resolve_ssl_verify(LLM_VERIFY_SSL)
 FACTS = ""
+_HTTP = requests.Session()
+
+
+def get_api_key():
+    """Anahtar sırası: koddaki LLM_API_KEY, IBTHINK_API_KEY ortam değişkeni, ibthink_anahtar.txt dosyası."""
+    raw = LLM_API_KEY or os.getenv("IBTHINK_API_KEY") or ""
+    if not raw and os.path.exists(KEY_FILE):
+        with open(KEY_FILE, encoding="utf-8") as f:
+            raw = f.read().strip()
+    return re.sub(r"^bearer\s+", "", raw.strip(), flags=re.I)
 
 
 def parse_json(text):
@@ -93,7 +104,8 @@ def parse_json(text):
 
 def ask_llm(system, user):
     """JSON sözlük döndürür; bozuk JSON'da bir kez düzeltme ister, geçici hatalarda bekleyip tekrar dener."""
-    headers = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
+    key = get_api_key()
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
     if NO_THINK:
         user += "\n\n/no_think"
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -103,7 +115,7 @@ def ask_llm(system, user):
         if LLM_MODEL:
             payload["model"] = LLM_MODEL
         try:
-            r = requests.post(LLM_URL, json=payload, headers=headers, timeout=LLM_TIMEOUT, verify=VERIFY)
+            r = _HTTP.post(LLM_URL, json=payload, headers=headers, timeout=LLM_TIMEOUT, verify=VERIFY)
         except requests.RequestException as e:
             last = f"{type(e).__name__}: {str(e)[:150]}"
             time.sleep(15 * (attempt + 1))

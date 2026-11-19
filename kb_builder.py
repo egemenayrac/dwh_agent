@@ -318,8 +318,8 @@ def clean_sql(s):
     return s.upper()
 
 
-def analyze(sql):
-    """(kind, target, refs, joins) - refs: {(qual|None, name, role)}, joins: {(q1, t1, c1, q2, t2, c2)}"""
+def _analyze_regex(sql):
+    """Regex tabanlı SQL analizi (sqlglot parse edemediğinde yedek olarak çalışır)."""
     s = clean_sql(sql)
     refs, target, kind = set(), None, "select"
     ctes = set(CTE_RE.findall(s))  # WITH ad AS (...) -> tablo değil
@@ -356,6 +356,89 @@ def analyze(sql):
                 e1, e2 = e2, e1
             joins.add(e1 + e2)
     return kind, target, refs, joins
+
+
+def _analyze_sqlglot(sql):
+    """sqlglot (Oracle diyalekti) ile AST tabanlı tablo, hedef ve join çıkarımı; başarısızsa None döner."""
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:
+        return None
+    try:
+        tree = sqlglot.parse_one(sql, read="oracle")
+    except Exception:
+        return None
+    if tree is None:
+        return None
+
+    refs, target, kind = set(), None, "select"
+    ctes = {(cte.alias or "").upper() for cte in tree.find_all(exp.CTE) if cte.alias}
+
+    def _tbl_pair(tbl):
+        name = (tbl.name or "").strip('"').upper()
+        qual = (tbl.db or "").strip('"').upper() or None
+        return qual, name
+
+    write_tbl = None
+    if isinstance(tree, exp.Create):
+        what = (tree.args.get("kind") or "").upper()
+        kind = ("view" if "VIEW" in what else
+                ("ctas" if tree.args.get("expression") is not None else "ddl"))
+        write_tbl = tree.this.this if isinstance(tree.this, exp.Schema) else tree.this
+    elif isinstance(tree, exp.Insert):
+        kind = "insert"
+        write_tbl = tree.this.this if isinstance(tree.this, exp.Schema) else tree.this
+    elif isinstance(tree, exp.Merge):
+        kind = "merge"
+        write_tbl = tree.this
+
+    write_key = None
+    if isinstance(write_tbl, exp.Table):
+        wq, wn = _tbl_pair(write_tbl)
+        if wn and wn not in NOT_TABLES:
+            target = f"{wq}.{wn}" if wq else wn
+            write_key = (wq, wn)
+            refs.add((wq, wn, "write"))
+
+    aliases = {}
+    for tbl in tree.find_all(exp.Table):
+        if tbl is write_tbl:
+            continue
+        q, n = _tbl_pair(tbl)
+        if not n or n in NOT_TABLES or q == "X_PARAM" or (q is None and n in ctes):
+            continue
+        if (q, n) != write_key:
+            refs.add((q, n, "read"))
+        alias = (tbl.alias or "").strip('"').upper()
+        for a in ([n] + ([alias] if alias and alias != n else [])):
+            aliases[a] = (q, n) if aliases.get(a, (q, n)) == (q, n) else None
+
+    joins = set()
+    for eq in tree.find_all(exp.EQ):
+        if isinstance(eq.left, exp.Column) and isinstance(eq.right, exp.Column):
+            a1, c1 = (eq.left.table or "").strip('"').upper(), (eq.left.name or "").strip('"').upper()
+            a2, c2 = (eq.right.table or "").strip('"').upper(), (eq.right.name or "").strip('"').upper()
+            if not (a1 and c1 and a2 and c2):
+                continue
+            t1, t2 = aliases.get(a1), aliases.get(a2)
+            if t1 and t2 and t1 != t2:
+                e1, e2 = (t1[0], t1[1], c1), (t2[0], t2[1], c2)
+                if (e1[1], e1[2]) > (e2[1], e2[2]):
+                    e1, e2 = e2, e1
+                joins.add(e1 + e2)
+
+    if not refs and not target:
+        return None
+    return kind, target, refs, joins
+
+
+def analyze(sql):
+    """(kind, target, refs, joins) - refs: {(qual|None, name, role)}, joins: {(q1, t1, c1, q2, t2, c2)}"""
+    res = _analyze_sqlglot(sql)
+    if res is not None:
+        return res
+    return _analyze_regex(sql)
 
 
 def sql_from_text(text):

@@ -76,9 +76,10 @@ def profile_table(conn, db, owner, table):
                      {"o": owner, "t": table})
     rows, want_hist = {}, []
     for col, nd, low, high, hist in stats:
+        if SKIP_COLUMN_RE.search(col):
+            continue
         rows[col] = [decode(low, types.get(col)), decode(high, types.get(col)), None]
-        if (hist in ("FREQUENCY", "TOP-FREQUENCY") and nd is not None and nd <= MAX_DISTINCT_FOR_VALUES
-                and not SKIP_COLUMN_RE.search(col)):
+        if hist in ("FREQUENCY", "TOP-FREQUENCY") and nd is not None and nd <= MAX_DISTINCT_FOR_VALUES:
             want_hist.append(col)
     for col in want_hist:
         hist = kb.fetch(conn, """SELECT endpoint_number, endpoint_value, endpoint_actual_value FROM all_tab_histograms

@@ -19,18 +19,19 @@ import ajan_core as core  # noqa: E402
 st.set_page_config(page_title="Veri Ambarı Ajanı", page_icon="📊", layout="wide")
 
 
-@st.cache_resource
-def get_db():
-    return core.open_kb()
-
-
 @st.cache_data(ttl=600)
 def get_stats():
-    return core.kb_stats(get_db())
+    conn = core.open_kb()
+    try:
+        return core.kb_stats(conn)
+    finally:
+        conn.close()
 
 
-db = get_db()
 ss = st.session_state
+if "db" not in ss:
+    ss.db = core.open_kb()
+db = ss.db
 ss.setdefault("conn", None)
 ss.setdefault("turns", [])        # her soru: {"sess", "ctx", "fb", "full_xlsx"}
 ss.setdefault("mail_turn", None)
@@ -157,12 +158,22 @@ def show_result(turn, key):
             turn["fb"] = "dogru"
             st.rerun()
         if c2.button("👎 Yanlış", key=f"bad{key}"):
+            turn["fb"] = "yanlis_not"
+            st.rerun()
+    elif turn.get("fb") == "yanlis_not":
+        note = st.text_input("Neyi yanlıştı? (isteğe bağlı — iyileştirme için kaydedilir)", key=f"fbnote{key}")
+        c1, c2, _ = st.columns([1.4, 1, 3.6])
+        if c1.button("Geri bildirimi kaydet", key=f"fbsave{key}", type="primary"):
+            core.save_feedback(db, sess.question, r.get("sql", ""), "yanlis", note)
             turn["fb"] = "yanlis"
+            st.rerun()
+        if c2.button("Vazgeç", key=f"fbcancel{key}"):
+            turn["fb"] = None
             st.rerun()
     elif turn.get("fb") == "dogru":
         st.caption("✓ Onaylı sorgu kütüphanesine eklendi.")
     elif turn.get("fb") == "yanlis":
-        st.caption("Yanlış olarak işaretlendi. Neyin yanlış olduğunu yeni bir mesajla yazarsan ajan düzeltmeyi dener.")
+        st.caption("✓ Geri bildirim kaydedildi. Neyin yanlış olduğunu yeni bir mesajla yazarsan ajan düzeltmeyi dener.")
 
 
 # ------------------------------- Sekmeler -------------------------------
@@ -224,7 +235,11 @@ with tab_olcum:
     tmpl = io.BytesIO()
     pd.DataFrame({"soru": ["Ekim 2026 sonu 90+ gecikmedeki nakit kredi sayısı"],
                   "dogru_sql": ["SELECT COUNT(*) FROM ..."], "kategori": ["gecikme"]}).to_excel(tmpl, index=False)
-    st.download_button("📄 Boş şablonu indir", tmpl.getvalue(), file_name="olcum_seti_sablon.xlsx")
+    ver_bytes, ver_count = core.export_verified_excel(db)
+    b1, b2 = st.columns(2)
+    b1.download_button("📄 Boş şablonu indir", tmpl.getvalue(), file_name="olcum_seti_sablon.xlsx")
+    b2.download_button(f"📥 Onaylı sorguları dışa aktar ({ver_count} sorgu)", ver_bytes,
+                       file_name="olcum_seti.xlsx", disabled=ver_count == 0)
     up = st.file_uploader("Ölçüm seti (soru, dogru_sql, isteğe bağlı kategori)", type=["xlsx", "csv"])
     if up is not None:
         data = pd.read_excel(up) if up.name.endswith("xlsx") else pd.read_csv(up, sep=";")
@@ -233,14 +248,20 @@ with tab_olcum:
             st.error("Dosyada 'soru' ve 'dogru_sql' kolonları olmalı.")
         else:
             st.write(f"{len(data)} soru. Tahmini süre: soru başına 1-3 dakika.")
+            disable_ver = st.checkbox(
+                "Ölçüm sırasında onaylı sorgu hafızasını kapat (önerilen: ezber sızıntısını önler)", value=True)
             if ss.conn is None:
                 st.warning("Ölçüm için Oracle bağlantısı gerekli.")
             elif st.button("Ölçümü başlat", type="primary"):
                 bar = st.progress(0.0)
                 rows = list(zip(data["soru"], data["dogru_sql"],
                                 data["kategori"] if "kategori" in data else [""] * len(data)))
-                run_id, res = core.evaluate(db, ss.conn, rows, on_progress=lambda i, n, r: bar.progress(
-                    i / n, text=f"{i}/{n}: {r['sonuc']} — {core.short(r['soru'], 60)}"))
+                run_id, res = core.evaluate(
+                    db, ss.conn, rows,
+                    on_progress=lambda i, n, r: bar.progress(
+                        i / n, text=f"{i}/{n}: {r['sonuc']} — {core.short(r['soru'], 60)}"),
+                    use_verified=not disable_ver,
+                )
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Doğru", f"{(res['sonuc'] == 'DOĞRU').sum()} / {len(res)}")
                 c2.metric("İncele", int((res["sonuc"] == "İNCELE").sum()))
@@ -257,3 +278,7 @@ with tab_olcum:
     if len(hist):
         st.markdown("**Önceki ölçümler** (iyileşmeyi buradan takip et)")
         st.dataframe(hist)
+    fb_neg = core.list_feedback(db, sonuc="yanlis", limit=30)
+    if len(fb_neg):
+        with st.expander(f"👎 Kayıtlı hatalı cevap geri bildirimleri ({len(fb_neg)})"):
+            st.dataframe(fb_neg)
