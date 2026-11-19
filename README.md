@@ -38,6 +38,9 @@ Ayrıntılı mimari ve tasarım kararları: [docs/mimari.md](docs/mimari.md)
 - Kod seviyesinde yalnızca tek bir `SELECT`/`WITH` sorgusu çalıştırılır (sqlglot + yasaklı kelime kontrolü).
   Ağır sorgular EXPLAIN PLAN maliyetiyle yakalanır. Önerilen kurulum: ajan için yalnızca SELECT yetkili ayrı bir
   veritabanı hesabı.
+- Tek yazma işlemi: kullanıcı açıkça isterse ve ekranda onaylarsa, bir SELECT sonucundan kullanıcının **kendi
+  şemasında yeni** bir tablo oluşturulur (`CREATE TABLE ... AS SELECT`). Var olan tablonun üzerine yazılmaz; başka
+  şemaya, INSERT/UPDATE/DELETE/DROP yapılamaz. Ölçüm modunda kapalıdır.
 - Bilgi tabanı kurulurken LLM'e yalnızca metadata ve SQL metni gider. Kişisel veri olabilecek kolonların değer
   profilleri alınmaz. Loglara veri satırı yazılmaz.
 - Şifre ve API anahtarı kodda tutulmaz. Bilgi tabanı (`kb/`) ve çıktılar repoya yüklenmez.

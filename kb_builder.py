@@ -376,7 +376,7 @@ def _analyze_sqlglot(sql):
     ctes = {(cte.alias or "").upper() for cte in tree.find_all(exp.CTE) if cte.alias}
 
     def _tbl_pair(tbl):
-        name = (tbl.name or "").strip('"').upper()
+        name = (tbl.name or "").strip('"').upper().split("@")[0]   # db link eki (TABLO@LINK) atılır
         qual = (tbl.db or "").strip('"').upper() or None
         return qual, name
 
