@@ -53,8 +53,17 @@ KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ibthink_ana
 KB_PATH = os.path.join(kb.KB_DIR, "kb.sqlite")
 LOG_PATH = os.path.join(kb.KB_DIR, "ajan_log.jsonl")
 PAUSE_TOOLS = {"plan_onayla", "kullaniciya_sor"}
-_HTTP = requests.Session()
+_HTTP_LOCAL = threading.local()
 _DB_LOCK = threading.Lock()
+
+
+def _http():
+    """Her iş parçacığı için ayrı kalıcı requests.Session döner (thread-safe Keep-Alive)."""
+    sess = getattr(_HTTP_LOCAL, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        _HTTP_LOCAL.session = sess
+    return sess
 
 _TR_FOLD_MAP = str.maketrans({
     "İ": "i", "I": "i", "ı": "i", "Ş": "s", "ş": "s", "Ğ": "g", "ğ": "g",
@@ -123,9 +132,10 @@ def llm_chat(messages, tools=None, no_think=False):
         raise RuntimeError(f"LLM API anahtarı yok. Sol panelden anahtarı gir ({kb.API_KEY_PAGE or 'anahtar sayfası'}).")
     headers = {"Authorization": f"Bearer {key}"}
     last = ""
+    sess = _http()
     for attempt in range(5):
         try:
-            r = _HTTP.post(LLM_URL, json=payload, headers=headers, timeout=LLM_TIMEOUT, verify=VERIFY)
+            r = sess.post(LLM_URL, json=payload, headers=headers, timeout=LLM_TIMEOUT, verify=VERIFY)
         except requests.RequestException as e:
             last = f"{type(e).__name__}: {str(e)[:200]}"
             time.sleep(10 * (attempt + 1))

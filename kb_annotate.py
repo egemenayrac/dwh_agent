@@ -26,6 +26,7 @@ import re
 import ssl
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -80,7 +81,16 @@ def resolve_ssl_verify(setting):
 
 VERIFY = resolve_ssl_verify(LLM_VERIFY_SSL)
 FACTS = ""
-_HTTP = requests.Session()
+_HTTP_LOCAL = threading.local()
+
+
+def _http():
+    """Her iş parçacığı için ayrı kalıcı requests.Session döner (thread-safe Keep-Alive)."""
+    sess = getattr(_HTTP_LOCAL, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        _HTTP_LOCAL.session = sess
+    return sess
 
 
 def get_api_key():
@@ -110,12 +120,13 @@ def ask_llm(system, user):
         user += "\n\n/no_think"
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     last = ""
+    sess = _http()
     for attempt in range(5):
         payload = {"messages": messages, "temperature": 0.0, "max_tokens": LLM_MAX_TOKENS, "stream": False}
         if LLM_MODEL:
             payload["model"] = LLM_MODEL
         try:
-            r = _HTTP.post(LLM_URL, json=payload, headers=headers, timeout=LLM_TIMEOUT, verify=VERIFY)
+            r = sess.post(LLM_URL, json=payload, headers=headers, timeout=LLM_TIMEOUT, verify=VERIFY)
         except requests.RequestException as e:
             last = f"{type(e).__name__}: {str(e)[:150]}"
             time.sleep(15 * (attempt + 1))
