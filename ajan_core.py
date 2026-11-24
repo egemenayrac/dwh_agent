@@ -623,10 +623,14 @@ MAİL:
 class Session:
     """Bir sorunun çözüm durumu; durdurulup devam ettirilebilir."""
 
-    def __init__(self, question, extra_system=""):
-        facts = onayli_bilgiler()
-        system = SYSTEM.format(today=dt.date.today().isoformat(),
-                               facts=("\nEKİBİN ONAYLADIĞI BİLGİLER (kesindir):\n" + facts) if facts else "")
+    def __init__(self, question, extra_system="", tools=None, system=None):
+        """tools/system verilmezse veri ambarı ajanının araçları ve sistem mesajı kullanılır (soru sekmesi).
+        Başka bir ajan (ör. inceleme.py) kendi araç listesini ve sistem mesajını verir."""
+        if system is None:
+            facts = onayli_bilgiler()
+            system = SYSTEM.format(today=dt.date.today().isoformat(),
+                                   facts=("\nEKİBİN ONAYLADIĞI BİLGİLER (kesindir):\n" + facts) if facts else "")
+        self.tools = tools
         self.question = question
         self.messages = [{"role": "system", "content": system + extra_system},
                          {"role": "user", "content": question}]
@@ -695,12 +699,13 @@ def run(sess, ctx, on_step=None, auto_approve=False):
     sess.status = "running"
     try:
         while sess.n_llm < MAX_STEPS:
-            msg = llm_chat(sess.messages, TOOLS)
+            tools = getattr(sess, "tools", None) or TOOLS
+            msg = llm_chat(sess.messages, tools)
             sess.n_llm += 1
             if msg.get("_finish") == "length":
                 # 4096 token sınırı doldu: düşünme kısmı yeri bitirmiş, cevap/araç çağrısı yarıda kesilmiş olabilir.
                 # Yarım çıktıyı atıp düşünmeden (kısa) tekrar iste.
-                msg = llm_chat(sess.messages, TOOLS, no_think=True)
+                msg = llm_chat(sess.messages, tools, no_think=True)
                 sess.n_llm += 1
             content = strip_think(msg.get("content"))
             calls = msg.get("tool_calls") or []

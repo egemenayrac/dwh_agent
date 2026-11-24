@@ -28,3 +28,7 @@ API_KEY_PAGE = "llm-portali.sirket.local/api-keys"
 # İstersen kb_builder'daki diğer ayarları da burada değiştirebilirsin, ör.:
 # META_MAX_AGE_DAYS = 30
 # PERSONAL_REGEX = r"^[ASTU]\d{3,}"
+
+# Şirket inceleme ajanı (inceleme.py)
+# EWS_DIR = r"G:\...\news_ingestion"          # llm_dogrulama.xlsx ve portfolio_config.py'nin bulunduğu klasör
+# DIS_PROXY = "http://proxy-sunucusu:8080"     # ilan.gov.tr / Google News / KAP için (boşsa doğrudan bağlanır)
