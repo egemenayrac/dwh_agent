@@ -9,7 +9,8 @@ Kaynaklar (araçlar):
   ews_ozet, ews_haberler, ortaklar  : EWS çıktıları (llm_dogrulama.xlsx, portfolio_config.py; EWS_DIR klasöründe)
   ilan_ara                          : ilan.gov.tr (tüm ilan türleri; şirket adı ya da VKN ile)
   google_haber                      : Google News RSS (başlık, kaynak, tarih, bağlantı)
-  (sonraki adımlar: kap_ara, dwh_sorgu)
+  kap_ara                           : KAP bildirimleri (kap_kaynak.py; kap_ingestion.py ile aynı mekanizma)
+  (sonraki adım: dwh_sorgu)
 
 Kurallar:
   - Çekmek serbest, saklamak yasak: dış kaynak sonuçları diske yazılmaz, yalnızca bu oturumun notunda kullanılır.
@@ -35,6 +36,7 @@ import pandas as pd
 import requests
 
 import ajan_core as core
+import kap_kaynak
 import kb_builder as kb
 
 # =============================== AYARLAR ===============================
@@ -48,6 +50,8 @@ HABER_MAKS = 25            # ews_haberler en fazla kayıt
 ILAN_GUN = 365
 ILAN_MAKS_SAYFA = 3        # ilan.gov.tr sayfa başına 20 ilan döndürüyor
 ILAN_DETAY_MAKS = 6        # metni okunacak en fazla ilan
+KAP_GUN = getattr(kb, "KAP_GUN", 30)          # gün gün, 4 sn aralık: 30 gün ~2 dk
+KAP_DETAY = getattr(kb, "KAP_DETAY", 15)      # metni okunacak en fazla bildirim (önce ODA, sonra FR)
 GOOGLE_GUN = 90
 GOOGLE_MAKS = 25
 DIS_BEKLEME = 1.0          # dış sitelere art arda istekler arasında saniye
@@ -135,6 +139,21 @@ def cekirdek_ad(unvan, aliases=()):
     return ad
 
 
+def dis_oturum(kullanici="", sifre=""):
+    """Dış siteler (ilan.gov.tr, Google News, KAP) için HTTP oturumu. DIS_PROXY tanımlıysa proxy üzerinden;
+    kullanıcı/şifre arayüzden gelir, dosyaya yazılmaz."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept-Language": "tr-TR,tr;q=0.9"})
+    if DIS_PROXY:
+        proxy = DIS_PROXY
+        if kullanici:
+            u, p = urllib.parse.quote(kullanici, safe=""), urllib.parse.quote(sifre or "", safe="")
+            proxy = proxy.replace("http://", f"http://{u}:{p}@", 1)
+        s.proxies.update({"http": proxy, "https": proxy})
+        s.verify = False   # kurumsal SSL incelemesi (mevcut KAP/haber kodlarındaki uygulama)
+    return s
+
+
 # ------------------------------- Bağlam ve araçlar -------------------------------
 class IncelemeCtx(core.Ctx):
     """İnceleme ajanının araçları. Veri ambarı ajanının Ctx'ini genişletir (Oracle bağlantısı ve db aynı)."""
@@ -145,17 +164,8 @@ class IncelemeCtx(core.Ctx):
         self.ews = EwsVerisi(ews_dir if ews_dir is not None else EWS_DIR)
         self.kaynaklar = {}          # "K1" -> {tur, baslik, tarih, url, metin}
         self.denetim = []
-        self.http = http or self._http_oturumu()
+        self.http = http or dis_oturum()
         self._son_istek = 0.0
-
-    @staticmethod
-    def _http_oturumu():
-        s = requests.Session()
-        s.headers.update({"User-Agent": UA, "Accept-Language": "tr-TR,tr;q=0.9"})
-        if DIS_PROXY:
-            s.proxies.update({"http": DIS_PROXY, "https": DIS_PROXY})
-            s.verify = False   # kurumsal SSL incelemesi (mevcut KAP/haber kodlarındaki uygulama)
-        return s
 
     def _bekle(self):
         gecen = time.monotonic() - self._son_istek
@@ -286,6 +296,48 @@ class IncelemeCtx(core.Ctx):
                        f"{a.get('title')}" + (f" · metin: {core.short(metin, 500)}" if metin else ""))
         return "\n".join(out)
 
+    # ---- KAP ----
+    def _kap_istemci(self):
+        if getattr(self, "_kap", None) is None:
+            s = requests.Session()               # KAP'ın kendi oturumu; proxy/SSL ayarı dış oturumla aynı
+            s.proxies.update(getattr(self.http, "proxies", {}) or {})
+            s.verify = getattr(self.http, "verify", True)
+            self._kap = kap_kaynak.KapClient(s)
+        return self._kap
+
+    def kap_ara(self, sirket="", sorgu="", gun=KAP_GUN):
+        r = self._bul(sirket)
+        comp = self.ews.companies().get(int(r["Şirket"])) or {}
+        ad = str(sorgu).strip() or cekirdek_ad(r["Şirket_Adi"], comp.get("aliases") or ())
+        kodlar = [str(t).upper() for t in (comp.get("tickers") or []) if t]
+        kap = self._kap_istemci()
+        adaylar, durum = kap.sirket_ara(ad)
+        if durum != "ok":
+            return f"KAP şirket araması başarısız ({durum}). Erişim/proxy kontrol edilmeli."
+        fa = fold(ad)
+        secilen = next((a for a in adaylar if fold(a["ad"]).startswith(fa)), None) or \
+            next((a for a in adaylar if fa in fold(a["ad"])), None)
+        if secilen is None and not kodlar:
+            liste = "; ".join(a["ad"] for a in adaylar[:5]) or "yok"
+            return (f"KAP'ta '{ad}' adlı işlem gören şirket bulunamadı (halka açık olmayabilir). Adaylar: {liste}. "
+                    f"Doğru şirket adaylardaysa sorgu parametresiyle tam adını ver.")
+        h = kap_kaynak.hedef(kodlar + ([secilen["kod"]] if secilen and secilen["kod"] else []),
+                             secilen["oid"] if secilen else "", secilen["ad"] if secilen else "")
+        kayitlar, ozet = kap.bildirimler(h, gun=int(gun), detay_maks=KAP_DETAY)
+        kim = f"{secilen['ad']} ({secilen['kod']})" if secilen else ", ".join(kodlar)
+        if not kayitlar:
+            return f"KAP: {kim} için son {gun} günde bildirim yok ({ozet})."
+        out = [f"KAP: {kim} — son {gun} günde {len(kayitlar)} bildirim ({ozet}). Metni okunanlar en fazla {KAP_DETAY}."]
+        for b in kayitlar:
+            tarih = b["published_at"].strftime("%Y-%m-%d") if b["published_at"] else ""
+            metin = maskele(b.get("body_text") or b.get("summary_text") or "")
+            baslik = b.get("subject") or b.get("summary_text") or "KAP bildirimi"
+            k = self.kaynak("KAP", baslik, tarih, b.get("disclosure_link"), f"{baslik} {b.get('summary_text') or ''} {metin}")
+            out.append(f"[{k}] {tarih} · {b.get('class_label') or b.get('disclosure_class') or '-'} · {baslik}"
+                       + (f" · özet: {core.short(b.get('summary_text'), 200)}" if b.get("summary_text") else "")
+                       + (f" · metin: {core.short(metin, 600)}" if metin and metin != b.get("summary_text") else ""))
+        return "\n".join(out)
+
     # ---- Google News ----
     def google_haber(self, sirket="", sorgu="", gun=GOOGLE_GUN):
         ad = self._arama_adi(sirket, sorgu)
@@ -322,6 +374,9 @@ INCELEME_TOOLS = [
     core._fn("ilan_ara", "ilan.gov.tr'de şirketin ilanları (tebligat: konkordato/iflas; icra satışları; ihaleler). "
              "sorgu boşsa şirketin kısa adı kullanılır; ortak için ortağın adını sorgu olarak ver.",
              dict(_SIRKET, sorgu=S, vkn=S, gun=I), []),
+    core._fn("kap_ara", "KAP'ta şirketin bildirimleri (özel durum açıklamaları, finansal raporlar). Yalnızca borsada "
+             "işlem gören şirketler; 30 gün ~2-3 dakika sürer. sorgu boşsa şirketin kısa adı.",
+             dict(_SIRKET, sorgu=S, gun=I), []),
     core._fn("google_haber", "Google News'te son haber başlıkları (EWS havuzunda olmayanlar için). sorgu boşsa şirketin "
              "kısa adı; ortak için ortağın adını ver.", dict(_SIRKET, sorgu=S, gun=I), []),
     next(t for t in core.TOOLS if t["function"]["name"] == "kullaniciya_sor"),
@@ -333,7 +388,7 @@ INCELEME_SYSTEM = """Sen bir bankanın kredi riski izleme ekibinde çalışan bi
 kaynakları toplayıp kısa bir kredi izleme notu yazmak. Bugünün tarihi: {today}.
 
 ÇALIŞMA YÖNTEMİ
-1. ews_ozet ile başla. Sonra ews_haberler, ortaklar, ilan_ara ve google_haber'i çağır. Hakim ortak varsa ilan_ara ve
+1. ews_ozet ile başla. Sonra ews_haberler, ortaklar, ilan_ara, kap_ara ve google_haber'i çağır. Hakim ortak varsa ilan_ara ve
    google_haber'i ortağın adıyla da çağır.
 2. Araç sonuçlarındaki her kayıt bir kaynak numarası taşır ([K1], [K2] ...). Nottaki HER bilgi cümlesinin sonuna
    dayandığı kaynak numarasını yaz. Araç çıktısında olmayan bir bilgiyi, rakamı ya da kaynağı YAZMA; kendi bilgini ekleme.
@@ -348,7 +403,7 @@ NOT ŞABLONU
 <Şirket unvanı> — Kredi İzleme Notu ({today}, ajan taslağı)
 1. Özet (3-5 madde)
 2. Olaylar ve haberler
-3. Resmi kayıtlar (ilan.gov.tr)
+3. Resmi kayıtlar (ilan.gov.tr, KAP)
 4. EWS seviyesi ve finansal göstergeler (EWS özetinden)
 5. Çelişkiler ve eksik bilgi
 6. Analiste sorular / önerilen kontroller
@@ -411,6 +466,31 @@ def incele(sess, ctx, on_step=None, auto_approve=True):
         if durum == "done":
             ctx.denetim = not_denetimi((sess.result or {}).get("cevap", ""), ctx.kaynaklar)
     return durum
+
+
+def not_markdown(sess, ctx):
+    """İndirilecek / kaydedilecek not: ajanın notu + denetim uyarıları + kaynak listesi."""
+    r = sess.result or {}
+    satirlar = [r.get("cevap", "").strip(), ""]
+    if ctx.denetim:
+        satirlar += ["> **Denetim uyarıları** (kontrol edilmeli):"] + [f"> - {d}" for d in ctx.denetim] + [""]
+    satirlar.append("## Kaynaklar (araç çıktıları)")
+    for k, v in ctx.kaynaklar.items():
+        bag = f" — {v['url']}" if v["url"] else ""
+        satirlar.append(f"- [{k}] {v['tur']} · {v['tarih']} · {v['baslik']}{bag}")
+    satirlar.append(f"\n_Ajan taslağıdır; seviye ve skor EWS kurallarındandır. {dt.datetime.now():%Y-%m-%d %H:%M}_")
+    return "\n".join(satirlar)
+
+
+def notu_kaydet(md, sirket, klasor=None):
+    """Notu iç klasöre yazar (kb/incelemeler). Dış kaynak ham sonuçları yazılmaz; yalnızca not."""
+    klasor = klasor or os.path.join(kb.KB_DIR, "incelemeler")
+    os.makedirs(klasor, exist_ok=True)
+    ad = re.sub(r"[^\w-]+", "_", str(sirket))[:40]
+    yol = os.path.join(klasor, f"{ad}_{dt.datetime.now():%Y%m%d_%H%M}.md")
+    with open(yol, "w", encoding="utf-8") as f:
+        f.write(md)
+    return yol
 
 
 def kaynak_listesi(ctx):

@@ -176,3 +176,77 @@ def test_incele_end_to_end_with_fake_llm_and_one_correction(tmp_path, monkeypatc
     assert any("K7" in m["content"] for m in sess.messages if m["role"] == "user")   # denetim geri gönderdi
     assert ctx.denetim == [] and "[K7]" not in sess.result["cevap"]
     assert len(inceleme.kaynak_listesi(ctx)) == len(ctx.kaynaklar) >= 3
+
+
+# ------------------------------- KAP -------------------------------
+import kap_kaynak  # noqa: E402
+
+_GOVDE = "<p>Şirketimiz İstanbul Asliye Ticaret Mahkemesine konkordato başvurusunda bulunmuştur.</p>"
+
+
+def _flight_html(ix, kod):
+    temel = {"disclosureBasic": {"disclosureIndex": ix, "publishDate": "20.11.2026 10:00:00", "title": "Özel Durum Açıklaması",
+                                 "stockCode": kod, "disclosureClass": "ODA", "summary": "Konkordato başvurusu"},
+             "disclosureBody": ["$2"]}
+    govde_bayt = len(_GOVDE.encode("utf-8"))           # T<hex> uzunluğu BAYT cinsindendir (Türkçe karakterler)
+    chunk = "1:" + json.dumps(temel, ensure_ascii=False) + "\n2:T" + format(govde_bayt, "x") + "," + _GOVDE
+    return "<html><script>self.__next_f.push([1," + json.dumps(chunk, ensure_ascii=False) + "])</script></html>"
+
+
+def test_kap_flight_parse_multibyte_body():
+    by_id = kap_kaynak.kapweb_next_data(_flight_html(555, "ORNEK"))
+    assert "konkordato başvurusunda" in kap_kaynak.kapweb_resolve_body(by_id)
+    recs = []
+    kap_kaynak.kapweb_collect_records(by_id, recs)
+    assert recs[0]["disclosureIndex"] == 555
+
+
+class FakeKapSession:
+    """kap.org.tr: ana sayfa, şirket araması, gün gün liste, detay sayfası."""
+
+    def __init__(self):
+        self.headers, self.proxies, self.verify, self.calls = {}, {}, True, []
+
+    def get(self, url, headers=None, timeout=None):
+        self.calls.append(("GET", url))
+        if url.endswith("/tr"):
+            return FakeResp(200, content=b"ok")
+        r = FakeResp(200)
+        r.text = _flight_html(555, "ORNEK")
+        return r
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append(("POST", url, json))
+        if url.endswith("/search/combined"):
+            return FakeResp(200, [{"category": "companyOrFunds", "results": [
+                {"searchValue": "ÖRNEK ÇELİK SANAYİ VE TİCARET A.Ş.", "searchType": "C", "memberOrFundOid": "oid1",
+                 "cmpOrFundCode": "ornek"}]}])
+        gun = json["fromDate"]
+        kayitlar = [{"disclosureBasic": {"disclosureIndex": 1, "stockCode": "BASKA", "companyTitle": "BAŞKA A.Ş.",
+                                         "mkkMemberOid": "x", "title": "Rutin", "publishDate": gun + " 09:00:00"}}]
+        if gun == FakeKapSession.hedef_gun:
+            kayitlar.append({"disclosureBasic": {"disclosureId": "4028abcdef0123", "disclosureIndex": 555,
+                                                 "stockCode": "ORNEK", "mkkMemberOid": "oid1",
+                                                 "companyTitle": "ÖRNEK ÇELİK SANAYİ VE TİCARET A.Ş.",
+                                                 "title": "Özel Durum Açıklaması", "disclosureClass": "ODA",
+                                                 "summary": "Konkordato başvurusu", "publishDate": gun + " 10:00:00"}})
+        return FakeResp(200, kayitlar)
+
+
+def test_kap_ara_filters_in_memory_and_reads_body(tmp_path, monkeypatch):
+    import datetime as _dt
+    FakeKapSession.hedef_gun = (_dt.date.today() - _dt.timedelta(days=1)).strftime("%d.%m.%Y")
+    monkeypatch.setattr(kap_kaynak, "KAPWEB_SLEEP", 0)
+    ctx = _ctx(tmp_path)
+    fake = FakeKapSession()
+    ctx._kap = kap_kaynak.KapClient(fake)
+    once = set(os.listdir(tmp_path))
+    out = ctx.kap_ara(gun=3)
+    assert "ÖRNEK ÇELİK" in out and "Rutin" not in out and "konkordato başvurusunda" in out   # başka şirket elendi
+    gunler = [c[2]["fromDate"] for c in fake.calls if c[0] == "POST" and c[1].endswith("/list/main")]
+    assert len(gunler) == 4                                                                     # gün gün (bugün + 3)
+    assert any(c[1].endswith("/tr/Bildirim/555") for c in fake.calls if c[0] == "GET")
+    k = [v for v in ctx.kaynaklar.values() if v["tur"] == "KAP"][0]
+    dun_iso = _dt.datetime.strptime(FakeKapSession.hedef_gun, "%d.%m.%Y").strftime("%Y-%m-%d")
+    assert k["url"] == "https://kap.org.tr/tr/Bildirim/555" and k["tarih"] == dun_iso    # tarih liste kaydından
+    assert set(os.listdir(tmp_path)) == once                                                   # diske bir şey yazılmadı

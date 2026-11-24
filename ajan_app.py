@@ -15,6 +15,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ajan_core as core  # noqa: E402
+import inceleme  # noqa: E402
 
 st.set_page_config(page_title="Veri Ambarı Ajanı", page_icon="📊", layout="wide")
 
@@ -35,6 +36,9 @@ db = ss.db
 ss.setdefault("conn", None)
 ss.setdefault("turns", [])        # her soru: {"sess", "ctx", "fb", "full_xlsx"}
 ss.setdefault("mail_turn", None)
+ss.setdefault("inceleme", None)   # {"sess", "ctx", "md", "yol", "fb"}
+ss.setdefault("dis_kimlik", ("", ""))
+SIRKET_PARAM = str(st.query_params.get("sirket", "") or "").strip()   # dashboard'dan "Ajanla incele" bağlantısı
 
 # ------------------------------- Sol panel -------------------------------
 with st.sidebar:
@@ -66,6 +70,13 @@ with st.sidebar:
                 pass
             ss.conn = None
             st.rerun()
+    if inceleme.DIS_PROXY:
+        with st.expander("Dış kaynak proxy'si (şirket inceleme)", expanded=not ss.dis_kimlik[0]):
+            pu = st.text_input("Proxy kullanıcı", value=ss.dis_kimlik[0], key="pxu")
+            pp = st.text_input("Proxy şifresi", type="password", key="pxp")
+            if st.button("Kaydet (yalnızca bu oturum)"):
+                ss.dis_kimlik = (pu.strip(), pp)
+                st.rerun()
     st.divider()
     stats = get_stats()
     st.caption(f"Bilgi tabanı: {stats['tablo']:,} tablo · {stats['kullanilan']:,} kullanılan · "
@@ -176,8 +187,75 @@ def show_result(turn, key):
         st.caption("✓ Geri bildirim kaydedildi. Neyin yanlış olduğunu yeni bir mesajla yazarsan ajan düzeltmeyi dener.")
 
 
+def show_inceleme(it):
+    sess, ctx = it["sess"], it["ctx"]
+    if sess.status == "error":
+        st.error(f"Hata: {sess.error}")
+        show_steps(sess, expanded=True)
+        return
+    if ctx.denetim:
+        st.warning("**Denetim uyarıları** — bu cümleleri kaynaklarıyla kontrol et:\n\n" +
+                   "\n".join(f"- {d}" for d in ctx.denetim))
+    st.markdown((sess.result or {}).get("cevap", ""))
+    kl = inceleme.kaynak_listesi(ctx)
+    if len(kl):
+        with st.expander(f"Kaynaklar ({len(kl)})"):
+            st.dataframe(kl, column_config={"bağlantı": st.column_config.LinkColumn("bağlantı")},
+                         hide_index=True, height=min(500, 40 + 35 * len(kl)))
+    c1, c2 = st.columns(2)
+    c1.download_button("📥 Notu indir (.md)", it["md"].encode("utf-8"),
+                       file_name=os.path.basename(it["yol"]) if it.get("yol") else "inceleme.md")
+    if it.get("yol"):
+        c2.caption(f"Kaydedildi: {it['yol']}")
+    show_steps(sess)
+    if it.get("fb") is None:
+        not_ = st.text_input("Not hakkında yorum (isteğe bağlı)", key="incfb")
+        b1, b2, _ = st.columns([1, 1, 4])
+        for btn, sonuc in ((b1, "inceleme_dogru"), (b2, "inceleme_yanlis")):
+            if btn.button("👍 İşe yaradı" if sonuc.endswith("dogru") else "👎 Sorunlu", key=f"inc_{sonuc}"):
+                core.save_feedback(db, sess.question, "", sonuc, (not_ or "") + "\n---\n" + it["md"][:4000])
+                it["fb"] = sonuc
+                st.rerun()
+    else:
+        st.caption("✓ Geri bildirim kaydedildi.")
+
+
 # ------------------------------- Sekmeler -------------------------------
-tab_soru, tab_mail, tab_olcum = st.tabs(["💬 Soru", "✉️ Mail talebi", "📏 Ölçüm"])
+_adlar = ["💬 Soru", "✉️ Mail talebi", "📏 Ölçüm", "🔎 Şirket İnceleme"]
+if SIRKET_PARAM:   # dashboard'dan gelindiyse inceleme sekmesi önde açılır
+    _adlar = [_adlar[3]] + _adlar[:3]
+_sekme = dict(zip(_adlar, st.tabs(_adlar)))
+tab_soru, tab_mail, tab_olcum, tab_inc = (_sekme[a] for a in
+                                          ("💬 Soru", "✉️ Mail talebi", "📏 Ölçüm", "🔎 Şirket İnceleme"))
+
+with tab_inc:
+    st.markdown("Bir şirket için EWS çıktıları, ilan.gov.tr ve Google News taranır; **kaynak gösterilmiş** bir "
+                "kredi izleme notu taslağı yazılır. Ajan seviye/skor vermez. Dış kaynak sonuçları saklanmaz; "
+                "yalnızca not kaydedilir.")
+    if not inceleme.EWS_DIR:
+        st.warning("ayarlar.py'de EWS_DIR tanımlı değil (llm_dogrulama.xlsx'in bulunduğu klasör).")
+    sirket = st.text_input("Şirket (müşteri numarası ya da unvan)", value=SIRKET_PARAM, key="inc_sirket")
+    if st.button("🔎 İncele", type="primary", disabled=not sirket.strip()):
+        try:
+            http = inceleme.dis_oturum(*ss.dis_kimlik)
+            sess, ctx = inceleme.yeni_oturum(db, ss.conn, sirket=sirket.strip(), http=http)
+            with st.status("İnceleniyor (1-3 dakika)...", expanded=True) as box:
+                inceleme.incele(sess, ctx, on_step=live_runner(box))
+                box.update(label="Tamamlandı" if sess.status == "done" else "Hata", state="complete")
+            it = {"sess": sess, "ctx": ctx, "fb": None, "md": "", "yol": ""}
+            if sess.status == "done":
+                it["md"] = inceleme.not_markdown(sess, ctx)
+                try:
+                    it["yol"] = inceleme.notu_kaydet(it["md"], sirket.strip())
+                except OSError as e:
+                    st.warning(f"Not kaydedilemedi: {e}")
+            ss.inceleme = it
+        except Exception as e:
+            st.error(f"İnceleme başlatılamadı: {type(e).__name__}: {str(e)[:300]}")
+        st.rerun()
+    if ss.inceleme:
+        st.divider()
+        show_inceleme(ss.inceleme)
 
 with tab_soru:
     for i, turn in enumerate(ss.turns):
