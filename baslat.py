@@ -22,6 +22,7 @@ if calisiyor_mu():
 else:
     p = subprocess.Popen([sys.executable, "-m", "streamlit", "run", os.path.join(klasor, "ajan_app.py"),
                           "--server.headless", "true", "--server.port", "8501",
+                          "--server.address", "127.0.0.1",   # yalnızca bu bilgisayardan erişilir (ağa açılmaz)
                           "--server.fileWatcherType", "none", "--browser.gatherUsageStats", "false"], cwd=klasor)
     with open(os.path.join(klasor, ".ajan_pid"), "w") as f:
         f.write(str(p.pid))
