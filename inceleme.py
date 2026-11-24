@@ -40,21 +40,32 @@ import kap_kaynak
 import kb_builder as kb
 
 # =============================== AYARLAR ===============================
-# ayarlar.py'de değiştirilebilir (kb_builder aracılığıyla okunur).
-EWS_DIR = getattr(kb, "EWS_DIR", "")                    # EWS çıktılarının klasörü (llm_dogrulama.xlsx ...)
-EWS_EXCEL = getattr(kb, "EWS_EXCEL", "llm_dogrulama.xlsx")
-EWS_CONFIG = getattr(kb, "EWS_CONFIG", "portfolio_config.py")
-DIS_PROXY = getattr(kb, "DIS_PROXY", "")                # dış siteler için proxy (http://host:port); boşsa doğrudan
+# Kuruma özel değerler önce aynı klasördeki ayarlar_inceleme.py'den (yoksa ayarlar.py'den) okunur.
+# ayarlar_inceleme.py GitHub'a gitmez (.gitignore); ayarlar.py'yi elle düzenlemeye gerek bırakmaz.
+try:
+    import ayarlar_inceleme as _ai
+except ImportError:
+    _ai = None
+
+
+def _ayar(ad, varsayilan):
+    return getattr(_ai, ad, getattr(kb, ad, varsayilan))
+
+
+EWS_DIR = _ayar("EWS_DIR", "")                    # EWS çıktılarının klasörü (llm_dogrulama.xlsx ...)
+EWS_EXCEL = _ayar("EWS_EXCEL", "llm_dogrulama.xlsx")
+EWS_CONFIG = _ayar("EWS_CONFIG", "portfolio_config.py")
+DIS_PROXY = _ayar("DIS_PROXY", "")                # dış siteler için proxy (http://host:port); boşsa doğrudan
 HABER_GUN = 180            # ews_haberler varsayılan penceresi
 HABER_MAKS = 25            # ews_haberler en fazla kayıt
 ILAN_GUN = 365
 ILAN_MAKS_SAYFA = 3        # ilan.gov.tr sayfa başına 20 ilan döndürüyor
 ILAN_DETAY_MAKS = 6        # metni okunacak en fazla ilan
-KAP_GUN = getattr(kb, "KAP_GUN", 30)          # gün gün, 4 sn aralık: 30 gün ~2 dk
-KAP_DETAY = getattr(kb, "KAP_DETAY", 15)      # metni okunacak en fazla bildirim (önce ODA, sonra FR)
+KAP_GUN = _ayar("KAP_GUN", 30)          # gün gün, 4 sn aralık: 30 gün ~2 dk
+KAP_DETAY = _ayar("KAP_DETAY", 15)      # metni okunacak en fazla bildirim (önce ODA, sonra FR)
 # DWH sorgu şablonları: {"ad": {"aciklama": "...", "sql": "SELECT ... WHERE ... = :cid"}}. Kuruma özeldir; repo'da
 # DEĞİL, ayarlar.py'de tanımlanır. :cid, incelenen şirketin müşteri numarasıyla bind edilir (SQL'e yazılmaz).
-INCELEME_SORGULARI = getattr(kb, "INCELEME_SORGULARI", {}) or {}
+INCELEME_SORGULARI = _ayar("INCELEME_SORGULARI", {}) or {}
 DWH_MAKS_SATIR = 60
 GOOGLE_GUN = 90
 GOOGLE_MAKS = 25

@@ -1,5 +1,6 @@
 # Kişisel / kuruma özel ayarlar ve gizli bilgiler
 ayarlar.py
+ayarlar_inceleme.py
 ibthink_anahtar.txt
 *_anahtar.txt
 

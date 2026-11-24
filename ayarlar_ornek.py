@@ -29,7 +29,8 @@ API_KEY_PAGE = "llm-portali.sirket.local/api-keys"
 # META_MAX_AGE_DAYS = 30
 # PERSONAL_REGEX = r"^[ASTU]\d{3,}"
 
-# Şirket inceleme ajanı (inceleme.py)
+# Şirket inceleme ajanı (inceleme.py). Bu değerler ayrı bir ayarlar_inceleme.py dosyasına da yazılabilir
+# (önce o okunur; ayarlar.py'yi düzenlemeye gerek kalmaz).
 # EWS_DIR = r"G:\...\news_ingestion"          # llm_dogrulama.xlsx ve portfolio_config.py'nin bulunduğu klasör
 # DIS_PROXY = "http://proxy-sunucusu:8080"     # ilan.gov.tr / Google News / KAP için (boşsa doğrudan bağlanır)
 # KAP_GUN = 30                                 # kap_ara penceresi (gün gün, 4 sn aralık: 30 gün ~2 dk)

@@ -314,3 +314,14 @@ def test_empty_result_gets_source_and_failed_correction_keeps_first_note(tmp_pat
     assert inceleme.incele(sess, ctx) == "done"
     assert "[K9]" in sess.result["cevap"]                                              # ilk not korundu
     assert any("K9" in d for d in ctx.denetim) and any("Düzeltme turu" in d for d in ctx.denetim)
+
+
+def test_ayarlar_inceleme_dosyasi_once_okunur(monkeypatch):
+    import importlib
+    monkeypatch.setitem(sys.modules, "ayarlar_inceleme", types.SimpleNamespace(KAP_GUN=7, DIS_PROXY="http://p:1"))
+    mod = importlib.reload(inceleme)
+    try:
+        assert mod.KAP_GUN == 7 and mod.DIS_PROXY == "http://p:1" and mod.KAP_DETAY == 15
+    finally:
+        monkeypatch.delitem(sys.modules, "ayarlar_inceleme")
+        importlib.reload(inceleme)
