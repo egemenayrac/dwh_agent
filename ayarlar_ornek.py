@@ -32,3 +32,9 @@ API_KEY_PAGE = "llm-portali.sirket.local/api-keys"
 # Şirket inceleme ajanı (inceleme.py)
 # EWS_DIR = r"G:\...\news_ingestion"          # llm_dogrulama.xlsx ve portfolio_config.py'nin bulunduğu klasör
 # DIS_PROXY = "http://proxy-sunucusu:8080"     # ilan.gov.tr / Google News / KAP için (boşsa doğrudan bağlanır)
+# KAP_GUN = 30                                 # kap_ara penceresi (gün gün, 4 sn aralık: 30 gün ~2 dk)
+# DWH sorgu şablonları (şirket inceleme ajanı yalnızca bunları çalıştırabilir; :cid müşteri numarasıyla bind edilir)
+# INCELEME_SORGULARI = {
+#     "portfoy_finansal": {"aciklama": "son bilanço göstergeleri ve bakiyeler",
+#                          "sql": "SELECT ... FROM <SEMA>.<TABLO> WHERE counterparty_id = :cid"},
+# }

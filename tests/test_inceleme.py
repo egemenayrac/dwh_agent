@@ -250,3 +250,46 @@ def test_kap_ara_filters_in_memory_and_reads_body(tmp_path, monkeypatch):
     dun_iso = _dt.datetime.strptime(FakeKapSession.hedef_gun, "%d.%m.%Y").strftime("%Y-%m-%d")
     assert k["url"] == "https://kap.org.tr/tr/Bildirim/555" and k["tarih"] == dun_iso    # tarih liste kaydından
     assert set(os.listdir(tmp_path)) == once                                                   # diske bir şey yazılmadı
+
+
+# ------------------------------- DWH şablonları -------------------------------
+class FakeCursor:
+    def __init__(self, log):
+        self.log, self.description = log, [("PART_ID",), ("NAKIT",)]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.log.append((sql, params))
+
+    def fetchmany(self, n):
+        return [(202609, 1.5e9), (202610, 1.4e9)]
+
+
+class FakeConn:
+    def __init__(self):
+        self.log = []
+
+    def cursor(self):
+        return FakeCursor(self.log)
+
+
+def test_dwh_sorgu_only_templates_with_bind(tmp_path, monkeypatch):
+    ctx = _ctx(tmp_path)
+    monkeypatch.setattr(inceleme, "INCELEME_SORGULARI", {})
+    assert "tanımlı değil" in ctx.dwh_sorgu("x")
+    sablon = {"bakiye": {"aciklama": "aylık bakiye", "sql": "SELECT part_id, nakit FROM S.T WHERE counterparty_id = :cid"}}
+    monkeypatch.setattr(inceleme, "INCELEME_SORGULARI", sablon)
+    assert "bakiye: aylık bakiye" in ctx.dwh_sorgu("")                     # ad yoksa liste
+    assert "bağlantısı yok" in ctx.dwh_sorgu("bakiye")
+    ctx.conn = FakeConn()
+    out = ctx.dwh_sorgu("bakiye")
+    assert "202609" in out and out.startswith("[K1]")
+    sql, params = ctx.conn.log[0]
+    assert params == {"cid": SID} and str(SID) not in sql                  # numara SQL'e yazılmadı, bind edildi
+    sablon["kotu"] = {"aciklama": "x", "sql": "DELETE FROM S.T WHERE counterparty_id = :cid"}
+    assert "SELECT" in _hata(lambda: ctx.dwh_sorgu("kotu"))                 # yalnızca SELECT

@@ -10,7 +10,7 @@ Kaynaklar (araçlar):
   ilan_ara                          : ilan.gov.tr (tüm ilan türleri; şirket adı ya da VKN ile)
   google_haber                      : Google News RSS (başlık, kaynak, tarih, bağlantı)
   kap_ara                           : KAP bildirimleri (kap_kaynak.py; kap_ingestion.py ile aynı mekanizma)
-  (sonraki adım: dwh_sorgu)
+  dwh_sorgu                         : Oracle, yalnızca ayarlar.INCELEME_SORGULARI'ndaki şablonlar (:cid bind)
 
 Kurallar:
   - Çekmek serbest, saklamak yasak: dış kaynak sonuçları diske yazılmaz, yalnızca bu oturumun notunda kullanılır.
@@ -52,6 +52,10 @@ ILAN_MAKS_SAYFA = 3        # ilan.gov.tr sayfa başına 20 ilan döndürüyor
 ILAN_DETAY_MAKS = 6        # metni okunacak en fazla ilan
 KAP_GUN = getattr(kb, "KAP_GUN", 30)          # gün gün, 4 sn aralık: 30 gün ~2 dk
 KAP_DETAY = getattr(kb, "KAP_DETAY", 15)      # metni okunacak en fazla bildirim (önce ODA, sonra FR)
+# DWH sorgu şablonları: {"ad": {"aciklama": "...", "sql": "SELECT ... WHERE ... = :cid"}}. Kuruma özeldir; repo'da
+# DEĞİL, ayarlar.py'de tanımlanır. :cid, incelenen şirketin müşteri numarasıyla bind edilir (SQL'e yazılmaz).
+INCELEME_SORGULARI = getattr(kb, "INCELEME_SORGULARI", {}) or {}
+DWH_MAKS_SATIR = 60
 GOOGLE_GUN = 90
 GOOGLE_MAKS = 25
 DIS_BEKLEME = 1.0          # dış sitelere art arda istekler arasında saniye
@@ -296,6 +300,29 @@ class IncelemeCtx(core.Ctx):
                        f"{a.get('title')}" + (f" · metin: {core.short(metin, 500)}" if metin else ""))
         return "\n".join(out)
 
+    # ---- DWH (yalnızca onaylı şablonlar) ----
+    def dwh_sorgu(self, ad="", sirket=""):
+        if not INCELEME_SORGULARI:
+            return "DWH sorgu şablonu tanımlı değil (ayarlar.py: INCELEME_SORGULARI). Banka verisi bölümü boş kalır."
+        if ad not in INCELEME_SORGULARI:
+            return "Şablonlar: " + "; ".join(f"{k}: {v.get('aciklama', '')}" for k, v in INCELEME_SORGULARI.items())
+        if self.conn is None:
+            return "Oracle bağlantısı yok (sol panelden bağlanılmalı); banka verisi alınamadı."
+        cid = int(self._bul(sirket)["Şirket"])
+        t = INCELEME_SORGULARI[ad]
+        sql = core.check_select(t["sql"])
+        with self.conn.cursor() as cur:
+            cur.execute(sql, {"cid": cid})
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchmany(DWH_MAKS_SATIR + 1)
+        df = pd.DataFrame(rows[:DWH_MAKS_SATIR], columns=cols)
+        if df.empty:
+            return f"DWH '{ad}': kayıt yok."
+        tablo = df.to_string(index=False, max_colwidth=40)
+        k = self.kaynak("DWH", f"{ad}: {t.get('aciklama', '')}", dt.date.today().isoformat(), "", tablo)
+        ek = f" (ilk {DWH_MAKS_SATIR} satır)" if len(rows) > DWH_MAKS_SATIR else ""
+        return f"[{k}] DWH '{ad}' — {t.get('aciklama', '')}{ek}:\n{tablo}"
+
     # ---- KAP ----
     def _kap_istemci(self):
         if getattr(self, "_kap", None) is None:
@@ -374,6 +401,9 @@ INCELEME_TOOLS = [
     core._fn("ilan_ara", "ilan.gov.tr'de şirketin ilanları (tebligat: konkordato/iflas; icra satışları; ihaleler). "
              "sorgu boşsa şirketin kısa adı kullanılır; ortak için ortağın adını sorgu olarak ver.",
              dict(_SIRKET, sorgu=S, vkn=S, gun=I), []),
+    core._fn("dwh_sorgu", "Banka verisi (bakiye, finansallar, sınıflama notu...) için ONAYLI sorgu şablonunu çalıştırır. "
+             "ad boşsa şablon listesini döner. SQL yazamazsın; yalnızca şablon adı verirsin.",
+             dict(_SIRKET, ad=S), []),
     core._fn("kap_ara", "KAP'ta şirketin bildirimleri (özel durum açıklamaları, finansal raporlar). Yalnızca borsada "
              "işlem gören şirketler; 30 gün ~2-3 dakika sürer. sorgu boşsa şirketin kısa adı.",
              dict(_SIRKET, sorgu=S, gun=I), []),
@@ -388,7 +418,8 @@ INCELEME_SYSTEM = """Sen bir bankanın kredi riski izleme ekibinde çalışan bi
 kaynakları toplayıp kısa bir kredi izleme notu yazmak. Bugünün tarihi: {today}.
 
 ÇALIŞMA YÖNTEMİ
-1. ews_ozet ile başla. Sonra ews_haberler, ortaklar, ilan_ara, kap_ara ve google_haber'i çağır. Hakim ortak varsa ilan_ara ve
+1. ews_ozet ile başla. Sonra ews_haberler, ortaklar, ilan_ara, kap_ara ve google_haber'i çağır. dwh_sorgu'yu
+   ad vermeden çağırıp şablonları gör, her şablonu bir kez çalıştır (banka verisi rakamları yalnızca buradan gelir). Hakim ortak varsa ilan_ara ve
    google_haber'i ortağın adıyla da çağır.
 2. Araç sonuçlarındaki her kayıt bir kaynak numarası taşır ([K1], [K2] ...). Nottaki HER bilgi cümlesinin sonuna
    dayandığı kaynak numarasını yaz. Araç çıktısında olmayan bir bilgiyi, rakamı ya da kaynağı YAZMA; kendi bilgini ekleme.
@@ -404,7 +435,7 @@ NOT ŞABLONU
 1. Özet (3-5 madde)
 2. Olaylar ve haberler
 3. Resmi kayıtlar (ilan.gov.tr, KAP)
-4. EWS seviyesi ve finansal göstergeler (EWS özetinden)
+4. Banka verisi ve EWS seviyesi (dwh_sorgu ve EWS özetinden; rakamları kaynaktaki gibi yaz)
 5. Çelişkiler ve eksik bilgi
 6. Analiste sorular / önerilen kontroller
 Kaynaklar: her [K#] için tek satır (tür, tarih, başlık)"""
