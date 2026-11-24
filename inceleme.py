@@ -183,6 +183,11 @@ class IncelemeCtx(core.Ctx):
                                "url": str(url or ""), "metin": str(metin or "")}
         return kid
 
+    def _yok(self, tur, mesaj):
+        """Sonuç yok / erişilemedi bulgusu da bir kaynak numarası alır; not 'yok' bulgusuna da atıf yapabilir."""
+        k = self.kaynak(tur, mesaj, dt.date.today().isoformat(), "", mesaj)
+        return f"[{k}] {mesaj}."
+
     def _bul(self, sirket):
         sirket = sirket if sirket not in (None, "") else self.sirket
         df = self.ews.sheet("Birlesik")
@@ -231,7 +236,8 @@ class IncelemeCtx(core.Ctx):
         sinir = pd.Timestamp.now() - pd.Timedelta(days=int(gun))
         kay = kay[kay["_t"].isna() | (kay["_t"] >= sinir)].sort_values("_t", ascending=False)
         if kay.empty:
-            return f"{r['Şirket_Adi']} için son {gun} günde {'ilgili ' if sadece_ilgili else ''}haber yok."
+            return self._yok("EWS", f"{r['Şirket_Adi']} için son {gun} günde {'ilgili ' if sadece_ilgili else ''}"
+                                    f"EWS haberi yok")
         out = [f"{r['Şirket_Adi']}: son {gun} günde {len(kay)} haber (en yeni {min(len(kay), HABER_MAKS)} tanesi):"]
         for _, h in kay.head(HABER_MAKS).iterrows():
             alinti = h.get("LLM_Alinti") if pd.notna(h.get("LLM_Alinti")) else ""
@@ -282,7 +288,7 @@ class IncelemeCtx(core.Ctx):
                 if len(ads) < 20:
                     break
         if not ilanlar:
-            return f"ilan.gov.tr: '{' / '.join(terimler)}' için son {gun} günde ilan yok."
+            return self._yok("ilan", f"ilan.gov.tr: '{' / '.join(terimler)}' için son {gun} günde ilan yok")
         out = [f"ilan.gov.tr: '{' / '.join(terimler)}' için {len(ilanlar)} ilan (son {gun} gün; bulunan: {toplam}). "
                f"Ad benzerliği nedeniyle başka şirketlere ait ilanlar olabilir; unvanı kontrol et."]
         for i, a in enumerate(ilanlar):
@@ -303,7 +309,8 @@ class IncelemeCtx(core.Ctx):
     # ---- DWH (yalnızca onaylı şablonlar) ----
     def dwh_sorgu(self, ad="", sirket=""):
         if not INCELEME_SORGULARI:
-            return "DWH sorgu şablonu tanımlı değil (ayarlar.py: INCELEME_SORGULARI). Banka verisi bölümü boş kalır."
+            return self._yok("DWH", "DWH sorgu şablonu tanımlı değil (ayarlar.py: INCELEME_SORGULARI); banka verisi "
+                                    "incelenmedi")
         if ad not in INCELEME_SORGULARI:
             return "Şablonlar: " + "; ".join(f"{k}: {v.get('aciklama', '')}" for k, v in INCELEME_SORGULARI.items())
         if self.conn is None:
@@ -317,7 +324,7 @@ class IncelemeCtx(core.Ctx):
             rows = cur.fetchmany(DWH_MAKS_SATIR + 1)
         df = pd.DataFrame(rows[:DWH_MAKS_SATIR], columns=cols)
         if df.empty:
-            return f"DWH '{ad}': kayıt yok."
+            return self._yok("DWH", f"DWH '{ad}': kayıt yok")
         tablo = df.to_string(index=False, max_colwidth=40)
         k = self.kaynak("DWH", f"{ad}: {t.get('aciklama', '')}", dt.date.today().isoformat(), "", tablo)
         ek = f" (ilk {DWH_MAKS_SATIR} satır)" if len(rows) > DWH_MAKS_SATIR else ""
@@ -353,7 +360,7 @@ class IncelemeCtx(core.Ctx):
         kayitlar, ozet = kap.bildirimler(h, gun=int(gun), detay_maks=KAP_DETAY)
         kim = f"{secilen['ad']} ({secilen['kod']})" if secilen else ", ".join(kodlar)
         if not kayitlar:
-            return f"KAP: {kim} için son {gun} günde bildirim yok ({ozet})."
+            return self._yok("KAP", f"KAP: {kim} için son {gun} günde bildirim yok ({ozet})")
         out = [f"KAP: {kim} — son {gun} günde {len(kayitlar)} bildirim ({ozet}). Metni okunanlar en fazla {KAP_DETAY}."]
         for b in kayitlar:
             tarih = b["published_at"].strftime("%Y-%m-%d") if b["published_at"] else ""
@@ -377,7 +384,7 @@ class IncelemeCtx(core.Ctx):
             return f"Google News HTTP {res.status_code} döndü. Erişim/proxy kontrol edilmeli."
         items = ET.fromstring(res.content).findall("./channel/item")
         if not items:
-            return f"Google News: '{ad}' için son {gun} günde haber yok."
+            return self._yok("google", f"Google News: '{ad}' için son {gun} günde haber yok")
         out = [f"Google News: '{ad}' için {len(items)} haber (en yeni {min(len(items), GOOGLE_MAKS)}; yalnızca başlık). "
                f"Spor kulübü, sponsorluk ve reklam haberleri gürültüdür."]
         for it in items[:GOOGLE_MAKS]:
@@ -427,7 +434,7 @@ kaynakları toplayıp kısa bir kredi izleme notu yazmak. Bugünün tarihi: {tod
 4. Seviye, stage ya da skor VERME ve değiştirme; EWS'in seviyesini olduğu gibi aktar. Görevin kanıtı özetlemek.
 5. Ad benzerliğine dikkat: ilan ve Google sonuçlarında başka bir şirkete, spor kulübüne, sponsorluğa, reklama ya da
    kampanyaya ait kayıtları notta kullanma (ör. "Türk Hava Yolları 0-3 Fenerbahçe" bir voleybol maçıdır).
-6. Bir araç hata verirse ya da sonuç yoksa bunu 5. bölümde yaz; tahmin yürütme.
+6. Bir araç hata verirse ya da sonuç yoksa bunu 5. bölümde, aracın verdiği kaynak numarasıyla yaz; tahmin yürütme.
 7. Bitince cevap_ver'i çağır. 'cevap' alanına notun tamamını yaz (en fazla ~500 kelime).
 
 NOT ŞABLONU
@@ -490,12 +497,17 @@ def incele(sess, ctx, on_step=None, auto_approve=True):
         return durum
     ctx.denetim = not_denetimi((sess.result or {}).get("cevap", ""), ctx.kaynaklar)
     if ctx.denetim:
+        ilk_sonuc, ilk_denetim = dict(sess.result or {}), list(ctx.denetim)
         sess.messages.append({"role": "user", "content": (
             "Not denetimi şu sorunları buldu:\n- " + "\n- ".join(ctx.denetim) +
             "\nBu sorunları düzelt (kaynaksız cümleleri ya kaynakla destekle ya da çıkar) ve cevap_ver'i tekrar çağır.")})
         durum = core.run(sess, ctx, on_step=on_step, auto_approve=auto_approve)
-        if durum == "done":
-            ctx.denetim = not_denetimi((sess.result or {}).get("cevap", ""), ctx.kaynaklar)
+        yeni = (sess.result or {}).get("cevap", "")
+        if durum == "done" and yeni.strip():
+            ctx.denetim = not_denetimi(yeni, ctx.kaynaklar)
+        else:   # düzeltme turu başarısız: ilk not, denetim uyarılarıyla birlikte geri gelir
+            sess.result, ctx.denetim = ilk_sonuc, ilk_denetim + [f"Düzeltme turu tamamlanamadı ({sess.error or durum})."]
+            sess.status, sess.error, durum = "done", None, "done"
     return durum
 
 

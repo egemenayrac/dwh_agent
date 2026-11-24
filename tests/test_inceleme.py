@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """inceleme.py testleri: Oracle, LLM ve internet olmadan (sahte EWS çıktısı, sahte HTTP, senaryolu sahte LLM)."""
 import json
+import re
 import os
 import sqlite3
 import sys
@@ -288,8 +289,28 @@ def test_dwh_sorgu_only_templates_with_bind(tmp_path, monkeypatch):
     assert "bağlantısı yok" in ctx.dwh_sorgu("bakiye")
     ctx.conn = FakeConn()
     out = ctx.dwh_sorgu("bakiye")
-    assert "202609" in out and out.startswith("[K1]")
+    assert "202609" in out and re.match(r"^\[K\d+\] DWH 'bakiye'", out)
     sql, params = ctx.conn.log[0]
     assert params == {"cid": SID} and str(SID) not in sql                  # numara SQL'e yazılmadı, bind edildi
     sablon["kotu"] = {"aciklama": "x", "sql": "DELETE FROM S.T WHERE counterparty_id = :cid"}
     assert "SELECT" in _hata(lambda: ctx.dwh_sorgu("kotu"))                 # yalnızca SELECT
+
+
+def test_empty_result_gets_source_and_failed_correction_keeps_first_note(tmp_path, monkeypatch):
+    ctx = _ctx(tmp_path)
+    monkeypatch.setattr(inceleme, "INCELEME_SORGULARI", {})
+    yok = ctx.dwh_sorgu()
+    assert yok.startswith("[K1]") and ctx.kaynaklar["K1"]["tur"] == "DWH"            # "yok" bulgusu atıf alabilir
+    sess, _ = inceleme.yeni_oturum(ctx.db, sirket=SID, ews_dir=ctx.ews.dir, http=ctx.http)
+    adim = iter([{"tool_calls": [_arac("cevap_ver", {"cevap": "1. Özet\n- Şirket hakkında uydurma bir iddia burada [K9]"}, 1)]}])
+
+    def fake_llm(messages, tools=None, no_think=False):
+        msg = dict(next(adim))        # ikinci turda StopIteration -> core.run 'error' döner
+        msg.setdefault("content", "")
+        return msg
+
+    monkeypatch.setattr(core, "llm_chat", fake_llm)
+    monkeypatch.setattr(core, "LOG_PATH", str(tmp_path / "log.jsonl"))
+    assert inceleme.incele(sess, ctx) == "done"
+    assert "[K9]" in sess.result["cevap"]                                              # ilk not korundu
+    assert any("K9" in d for d in ctx.denetim) and any("Düzeltme turu" in d for d in ctx.denetim)
