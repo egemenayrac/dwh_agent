@@ -207,6 +207,7 @@ döngü (en fazla 30 LLM adımı):
 | `tekillik_kontrol(sql, anahtarlar)` | `COUNT(*)` ile `COUNT(DISTINCT anahtar)` karşılaştırması | Join'den kaynaklanan satır çoğalmasını yakalamak için |
 | `plan_onayla(plan)` | Karmaşık sorularda SQL yazmadan önce planı kullanıcıya onaylatır | Yanlış yorumu erkenden yakalamak için (insan döngüde) |
 | `kullaniciya_sor(soru)` | Belirsizlik ya da tablo seçimi için kullanıcıya sorar | Uydurmak yerine sormak için |
+| `tablo_olustur(tablo_adi, sql, aciklama)` | Kullanıcı açıkça isterse SELECT sonucundan kullanıcının kendi şemasında yeni tablo (CTAS). Ekranda SQL gösterilip onay alınmadan çalışmaz | Analistin "şunu tabloya at" ihtiyacı; kontrollü tek yazma işlemi |
 | `cevap_ver(cevap, sql, varsayimlar)` | Nihai cevap, SQL ve varsayımlar | Yapılandırılmış bitiş |
 
 ### 5.4 System prompt'un ana kuralları
@@ -232,6 +233,9 @@ Ayrıca Oracle sözdizimi kuralları verilir (`FETCH FIRST`, `ADD_MONTHS`, YYYYM
   ayrı, sadece SELECT yetkili bir servis hesabı.
 - **Kod katmanı:** Sorgu `SELECT`/`WITH` ile başlamalı. `sqlglot` (Oracle diyalekti) ile tek ifade ve okuma türü
   kontrol edilir, ayrıştırılamazsa yorumlar ve string'ler temizlenip `;` ve yasaklı kelimeler regex ile aranır.
+- **Tablo oluşturma (tek yazma işlemi):** `tablo_olustur` yalnızca kullanıcının kendi şemasında, var olmayan bir adla
+  `CREATE TABLE ... AS SELECT` çalıştırır. SELECT kısmı aynı kontrollerden geçer, tablo adı katı bir kalıpla doğrulanır,
+  SQL ekranda gösterilir ve kullanıcı "Onayla"ya basmadan çalışmaz. Ölçüm modunda kapalıdır.
 - **Ağır sorgu koruması:** EXPLAIN PLAN maliyeti ya da tahmini satır sayısı eşiği aşarsa çalıştırılmaz, model
   filtre eklemeye ya da kullanıcı onayı almaya yönlendirilir.
 - Sorgu zaman aşımı 3 dakika, ekranda en fazla 5000 satır. Tam Excel dışa aktarımı ayrı düğmeyle yapılır (en fazla
@@ -288,7 +292,7 @@ görmek. Hissiyatla karar vermemek.
 | Yapılmayan | Neden |
 |---|---|
 | Fine-tuning | Elde etiketli soru-SQL verisi yok, bankanın modelini eğitme yetkisi yok. Onaylı sorgu kütüphanesi + iyi kartlar daha hızlı ve şeffaf. |
-| Ajanın veri tablosu yazması (CREATE/INSERT) | Risk. Şimdilik salt okuma. |
+| INSERT/UPDATE/DELETE/DROP, başka şemaya yazma | Risk. Tek yazma işlemi kontrollü `tablo_olustur` (kendi şemada, yeni tablo, insan onayıyla). |
 | Otomatik mail gönderimi | Yanlış veri dışarı gitmesin. Sadece taslak, insan gönderir. |
 | Vektör veritabanı | Önce anahtar kelime aramasının yetersiz kaldığı yer ölçülecek. |
 | Çoklu ajan (planlayıcı, SQL yazarı, denetçi ayrı modeller) | Paralel limit 1, 27B model. Tek ajan + kontrol araçları daha öngörülebilir. |

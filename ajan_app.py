@@ -109,7 +109,8 @@ def show_result(turn, key):
         return
     if sess.status == "waiting":
         p = sess.pending
-        title = "📋 Plan onayı" if p["kind"] == "plan_onayla" else "❓ Ajanın sorusu"
+        title = {"plan_onayla": "📋 Plan onayı", "tablo_olustur": "🛠️ Tablo oluşturma onayı"}.get(
+            p["kind"], "❓ Ajanın sorusu")
         with st.container(border=True):
             st.markdown(f"**{title}**")
             st.markdown(p["text"])

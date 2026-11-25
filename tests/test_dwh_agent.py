@@ -187,3 +187,24 @@ def test_check_select_guards():
             assert False, f"Engellenmeliydi: {bad}"
         except ValueError:
             pass
+
+
+def test_tablo_olustur_reddeder_baska_sema_gecersiz_ad_ve_yazma_sorgusu():
+    class _Conn:
+        username = "a12345"
+    ctx = core.Ctx(_make_test_db(), _Conn())
+    sel = "SELECT 1 FROM DUAL"
+    prep, err = ctx.tablo_hazirla("HIST.YENI", sel)
+    assert prep is None and "kendi şemasında" in err
+    prep, err = ctx.tablo_hazirla("X; DROP TABLE Y", sel)
+    assert prep is None and "Geçersiz tablo adı" in err
+    prep, err = ctx.tablo_hazirla("YENI", "DELETE FROM HIST.CASH_LOANS")
+    assert prep is None and err.startswith("ÇALIŞTIRILMADI")
+
+
+def test_tablo_olustur_olcum_modunda_calismaz():
+    sess, ctx = core.Session("x"), core.Ctx(_make_test_db(), None)
+    calls = [{"id": "c1", "function": {"name": "tablo_olustur",
+                                       "arguments": json.dumps({"tablo_adi": "T", "sql": "SELECT 1 FROM DUAL"})}}]
+    assert core._process_calls(sess, ctx, calls, None, auto_approve=True) == "continue"
+    assert sess.pending is None

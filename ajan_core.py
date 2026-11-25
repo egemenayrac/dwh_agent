@@ -47,6 +47,7 @@ EXPORT_MAX_ROWS = 500_000      # "tüm sonucu Excel'e" için üst sınır
 EVAL_MAX_ROWS = 50_000         # ölçümde altın SQL ve ajan SQL'i için ortak üst sınır
 HEAVY_COST = 5_000_000         # EXPLAIN PLAN maliyeti bunu aşarsa uyarı
 HEAVY_ROWS = 50_000_000        # tahmini satır sayısı bunu aşarsa uyarı
+CTAS_TIMEOUT_MS = 30 * 60_000  # tablo oluşturma (CREATE TABLE AS SELECT) zaman aşımı
 # ======================================================================
 
 KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ibthink_anahtar.txt")
@@ -318,6 +319,10 @@ TOOLS = [
         "planı kullanıcıya onaylatır. Kullanıcının cevabını döner.", {"plan": S}, ["plan"]),
     _fn("kullaniciya_sor", "Kullanıcıya soru sorar ve cevabını döner: tablo seçimini onaylatmak, belirsizliği "
         "gidermek, ağır sorgu için izin almak.", {"soru": S}, ["soru"]),
+    _fn("tablo_olustur", "SADECE kullanıcı açıkça tablo oluşturmanı isterse: verilen SELECT'in sonucuyla "
+        "kullanıcının KENDİ şemasında yeni bir tablo oluşturur (CREATE TABLE ... AS SELECT). Var olan tablonun "
+        "üzerine yazmaz. Önce SELECT'i sql_calistir ile dene. Kullanıcı ekranda onaylayınca çalışır.",
+        {"tablo_adi": S, "sql": S, "aciklama": S, "zorla": {"type": "boolean"}}, ["tablo_adi", "sql"]),
     _fn("cevap_ver", "İş bitince çağrılır. Kısa Türkçe cevap, kullanılan nihai SQL (yoksa boş) ve varsayımlar.",
         {"cevap": S, "sql": S, "varsayimlar": S}, ["cevap"]),
 ]
@@ -330,6 +335,7 @@ class Ctx:
         self.db, self.conn = db, conn
         self.use_verified = use_verified
         self.last_df, self.last_sql, self.last_more = None, None, False
+        self.created = []
         self._graph = None
 
     # ---- yardımcılar ----
@@ -561,6 +567,55 @@ class Ctx:
         return (f"{len(df)}{'+ (ilk ' + str(SHOW_ROWS) + ')' if more else ''} satır, {len(df.columns)} kolon, "
                 f"{time.time() - t0:.1f} sn.\nKolonlar: {', '.join(df.columns)}\nİlk satırlar:\n{head}")
 
+    def tablo_hazirla(self, tablo_adi, sql, aciklama="", zorla=False):
+        """tablo_olustur için kontroller; (hazırlık sözlüğü, None) ya da (None, hata metni) döner."""
+        if self.conn is None:
+            return None, "Oracle bağlantısı yok. Kullanıcıdan sol paneldeki 'Bağlan' ile bağlanmasını iste."
+        own = (self.conn.username or "").upper()
+        ad = (tablo_adi or "").strip().strip('"').upper()
+        if "." in ad:
+            sema, ad = ad.split(".", 1)
+            if sema.strip('"') != own:
+                return None, f"ÇALIŞTIRILMADI: Tablo sadece kullanıcının kendi şemasında ({own}) oluşturulabilir."
+            ad = ad.strip('"')
+        if not re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", ad):
+            return None, "ÇALIŞTIRILMADI: Geçersiz tablo adı (harfle başlamalı; harf, rakam ve _ kullan)."
+        try:
+            s = check_select(sql)
+        except ValueError as e:
+            return None, f"ÇALIŞTIRILMADI: {e}"
+        try:
+            var = fetch_df(self.conn, f"SELECT COUNT(*) FROM all_objects WHERE owner = '{own}' "
+                                      f"AND object_name = '{ad}'", 1)[0].iloc[0, 0]
+        except Exception as e:
+            return None, f"ORACLE HATASI: {str(e)[:300]}"
+        if var:
+            return None, f"ÇALIŞTIRILMADI: {own}.{ad} zaten var. Üzerine yazılmaz; kullanıcıdan başka bir ad iste."
+        cost, card = explain_cost(self.conn, s)
+        if not zorla and ((cost and cost > HEAVY_COST) or (card and card > HEAVY_ROWS)):
+            return None, (f"UYARI: Sorgu ağır görünüyor (tahmini maliyet {cost}, tahmini satır {card}). Filtre ekle "
+                          f"ya da kullanıcı onaylarsa zorla=true ile tekrar çağır.")
+        return {"owner": own, "ad": ad, "sql": s, "aciklama": aciklama or "", "satir_tahmini": card}, None
+
+    def tablo_olustur_calistir(self, p):
+        """Kullanıcı onayından sonra CREATE TABLE ... AS SELECT çalıştırır (yalnızca kendi şemasında, yeni tablo)."""
+        if self.conn is None:
+            return "Oracle bağlantısı yok."
+        old, t0 = self.conn.call_timeout, time.time()
+        hedef = '"' + p["owner"] + '"."' + p["ad"] + '"'
+        self.conn.call_timeout = CTAS_TIMEOUT_MS
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(f"CREATE TABLE {hedef} AS {p['sql']}")
+            n = fetch_df(self.conn, f"SELECT COUNT(*) FROM {hedef}", 1)[0].iloc[0, 0]
+        except Exception as e:
+            return f"ORACLE HATASI (tablo oluşturulamadı): {str(e)[:600]}"
+        finally:
+            self.conn.call_timeout = old
+        ad = p["owner"] + "." + p["ad"]
+        self.created.append(ad)
+        return f"Tablo oluşturuldu: {ad} ({int(n):,} satır, {time.time() - t0:.0f} sn)."
+
     def tekillik_kontrol(self, sql, anahtar_kolonlar):
         if self.conn is None:
             return "Oracle bağlantısı yok."
@@ -584,7 +639,7 @@ class Ctx:
 
 # ------------------------------ Ajan döngüsü ------------------------------
 SYSTEM = """Sen bir bankanın kredi riski ekibi için çalışan uzman bir veri analisti ajanısın. Oracle veri ambarında
-araçlarla çalışırsın. Bugünün tarihi: {today}. Veritabanına sadece okuma erişimin var.
+araçlarla çalışırsın. Bugünün tarihi: {today}. Veritabanında sadece okuma yaparsın; tek istisna tablo_olustur aracıdır.
 
 ÇALIŞMA YÖNTEMİ
 1. Önce bilgi_ara ile ilgili tabloları, onaylı ve benzer geçmiş sorguları bul. Türkçe/İngilizce eş anlamlıları ve
@@ -601,6 +656,9 @@ araçlarla çalışırsın. Bugünün tarihi: {today}. Veritabanına sadece okum
 10. Bitince cevap_ver çağır: 3-10 satırlık tam bir Türkçe cevap (ana sonuç rakamlarla), nihai SQL ve varsayımlar.
     Sonuç tablosunu cevaba kopyalama; tablo ekranda ve Excel'de zaten görünüyor. Kullanıcının istemediği
     kırılımı (ör. ay bazında) ekleme; gerekirse sadece öner.
+11. Kullanıcı açıkça "tablo oluştur / tabloya yaz / kaydet" derse: önce SELECT'i sql_calistir ile dene, sonra
+    tablo_olustur çağır (kullanıcının kendi şemasında, yeni bir ad ile). Tablo adı verilmediyse kısa, anlamlı bir ad
+    öner. INSERT/UPDATE/DELETE/DROP gibi başka hiçbir yazma işlemi yapamazsın.
 
 ORACLE KURALLARI
 - LIMIT yok: FETCH FIRST n ROWS ONLY. Tarih: TRUNC(SYSDATE), ADD_MONTHS(...), DATE '2026-01-31'.
@@ -670,6 +728,26 @@ def _process_calls(sess, ctx, calls, on_step, auto_approve):
             sess.messages.append({"role": "tool", "tool_call_id": c["id"], "content": "Cevap kaydedildi."})
             sess.steps.append({"arac": name, "girdi": "", "cikti": str(args.get("cevap") or "")})
             return "done"
+        if name == "tablo_olustur":
+            prep, err = ctx.tablo_hazirla(**{k: v for k, v in args.items()
+                                             if k in ("tablo_adi", "sql", "aciklama", "zorla")})
+            if err or auto_approve:
+                out = err or "Ölçüm/otomatik modda tablo oluşturulmaz."
+                sess.messages.append({"role": "tool", "tool_call_id": c["id"], "content": out})
+                sess.steps.append({"arac": name, "girdi": json.dumps(args, ensure_ascii=False), "cikti": out})
+                if on_step:
+                    on_step(sess.steps[-1])
+                continue
+            tahmin = f" (tahmini {int(prep['satir_tahmini']):,} satır)" if prep["satir_tahmini"] else ""
+            text = (f"Ajan şemanda yeni bir tablo oluşturmak istiyor: **{prep['owner']}.{prep['ad']}**{tahmin}\n\n"
+                    f"{prep['aciklama']}\n\n```sql\nCREATE TABLE {prep['owner']}.{prep['ad']} AS\n{prep['sql']}\n```\n"
+                    f"Onaylarsan oluşturulur. İstemiyorsan düzeltmeni yazıp 'Düzeltmeyi gönder'e bas.")
+            sess.pending = {"call_id": c["id"], "kind": name, "text": text, "rest": calls[i + 1:], "prep": prep}
+            sess.steps.append({"arac": name, "girdi": json.dumps(args, ensure_ascii=False),
+                               "cikti": "(kullanıcı onayı bekleniyor)"})
+            if on_step:
+                on_step(sess.steps[-1])
+            return "waiting"
         if name in PAUSE_TOOLS:
             text = args.get("plan") or args.get("soru") or ""
             if auto_approve:
@@ -733,8 +811,12 @@ def run(sess, ctx, on_step=None, auto_approve=False):
 def resume(sess, ctx, answer, on_step=None, auto_approve=False):
     """Kullanıcının cevabını bekleyen araca verip döngüye kaldığı yerden devam eder."""
     p, sess.pending = sess.pending, None
-    sess.messages.append({"role": "tool", "tool_call_id": p["call_id"], "content": f"Kullanıcının cevabı: {answer}"})
-    sess.steps[-1]["cikti"] = f"Kullanıcı: {answer}"
+    content = f"Kullanıcının cevabı: {answer}"
+    if p["kind"] == "tablo_olustur":
+        content = (ctx.tablo_olustur_calistir(p["prep"]) if str(answer).startswith("Onaylandı")
+                   else f"Kullanıcı tablo oluşturmayı onaylamadı. Kullanıcının cevabı: {answer}")
+    sess.messages.append({"role": "tool", "tool_call_id": p["call_id"], "content": content})
+    sess.steps[-1]["cikti"] = f"Kullanıcı: {answer}" + (f"\n{content}" if p["kind"] == "tablo_olustur" else "")
     state = _process_calls(sess, ctx, p["rest"], on_step, auto_approve)
     if state == "done":
         sess.status = "done"
