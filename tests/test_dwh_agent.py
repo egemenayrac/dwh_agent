@@ -208,3 +208,334 @@ def test_tablo_olustur_olcum_modunda_calismaz():
                                        "arguments": json.dumps({"tablo_adi": "T", "sql": "SELECT 1 FROM DUAL"})}}]
     assert core._process_calls(sess, ctx, calls, None, auto_approve=True) == "continue"
     assert sess.pending is None
+
+
+def test_schemas_generate_openai_tools_and_validate_args():
+    import schemas
+
+    tools = schemas.build_openai_tools()
+    names = [t["function"]["name"] for t in tools]
+    expected = [
+        "bilgi_ara", "tablo_karti", "join_yolu", "koken", "son_donem",
+        "sql_calistir", "tekillik_kontrol", "plan_onayla", "kullaniciya_sor",
+        "tablo_olustur", "cevap_ver",
+    ]
+    assert names == expected
+    assert core.TOOLS == tools
+
+    for t in tools:
+        assert t["type"] == "function"
+        params = t["function"]["parameters"]
+        assert params["type"] == "object"
+        assert "title" not in params
+        assert isinstance(params["properties"], dict)
+        assert isinstance(params["required"], list)
+
+    # Doğrulama ve tip dönüşümü
+    ok_args, err = schemas.validate_tool_args("bilgi_ara", '{"kelimeler": "gecikme, dpd"}')
+    assert err is None and ok_args == {"kelimeler": ["gecikme", "dpd"]}
+
+    bad_args, bad_err = schemas.validate_tool_args("sql_calistir", '{"amac": "test"}')
+    assert bad_args is None and bad_err is not None and "sql" in bad_err
+
+    # Kart şemaları (kb_annotate.py)
+    tcard = schemas.TableCardSchema.model_validate({
+        "ozet": "Kredi bakiyeleri",
+        "anahtar_kolonlar": "LOAN_ID",
+        "tarih_kolonlari": ["AS_OF_DT"],
+        "tuzaklar": ["AS_OF_DT filtresi şart"],
+    })
+    assert tcard.anahtar_kolonlar == ["LOAN_ID"]
+    assert tcard.tarih_kolonlari[0].kolon == "AS_OF_DT"
+
+
+def test_openai_httpx_tenacity_retry_in_ajan_core_and_kb_annotate(monkeypatch):
+    import httpx
+    import openai
+    import schemas
+
+    # URL dönüşümü ve SSL doğrulama yardımcıları
+    assert core.openai_base_url("https://ibthink.banka.local/v1/chat/completions") == "https://ibthink.banka.local/v1"
+    assert core.build_httpx_verify(False) is False
+    assert core.build_httpx_verify(True) is True
+
+    # 1) ajan_core.llm_chat: 429 (Retry-After: 0) + 503 -> 200 OK (tool_call dahil)
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        assert str(request.url) == "https://ibthink.local/v1/chat/completions"
+        assert request.headers["authorization"] == "Bearer test-key"
+        if attempts["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"}, json={"error": {"message": "rate limit"}})
+        if attempts["n"] == 2:
+            return httpx.Response(503, json={"error": {"message": "temporarily unavailable"}})
+        return httpx.Response(200, json={
+            "id": "cmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "qwen3-27b",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>düşünüyor</think>Arıyorum.",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bilgi_ara", "arguments": '{"kelimeler": ["dpd"]}'},
+                    }],
+                },
+            }],
+        })
+
+    mock_http = httpx.Client(transport=httpx.MockTransport(handler))
+    mock_client = openai.OpenAI(base_url="https://ibthink.local/v1", api_key="test-key", http_client=mock_http, max_retries=0)
+    monkeypatch.setattr(core, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(core, "LLM_MODEL", "qwen3-27b")
+    monkeypatch.setattr(core, "LLM_RETRIES", 4)
+    monkeypatch.setattr(core, "_openai_client", lambda key: mock_client)
+    monkeypatch.setattr(core._WaitWithRetryAfter, "__call__", lambda self, rs: 0.0)
+
+    msg = core.llm_chat([{"role": "user", "content": "DPD nedir?"}], tools=core.TOOLS)
+    assert attempts["n"] == 3
+    assert msg["_finish"] == "tool_calls"
+    assert msg["tool_calls"][0]["function"]["name"] == "bilgi_ara"
+
+    # 2) 401 yetki hatasında tekrar denemeden hemen hata fırlatmalı
+    auth_attempts = {"n": 0}
+
+    def auth_fail(request: httpx.Request) -> httpx.Response:
+        auth_attempts["n"] += 1
+        return httpx.Response(401, json={"error": {"message": "bad key"}})
+
+    auth_client = openai.OpenAI(
+        base_url="https://ibthink.local/v1",
+        api_key="bad",
+        http_client=httpx.Client(transport=httpx.MockTransport(auth_fail)),
+        max_retries=0,
+    )
+    monkeypatch.setattr(core, "_openai_client", lambda key: auth_client)
+    try:
+        core.llm_chat([{"role": "user", "content": "test"}])
+        assert False, "401 hatası fırlatılmalıydı"
+    except RuntimeError as exc:
+        assert "401" in str(exc) and auth_attempts["n"] == 1
+
+    # 3) kb_annotate.ask_llm: 502 geçici hatadan sonra Pydantic TableCardSchema ile doğrulanmış kart
+    ann_attempts = {"n": 0}
+
+    def ann_handler(request: httpx.Request) -> httpx.Response:
+        ann_attempts["n"] += 1
+        if ann_attempts["n"] == 1:
+            return httpx.Response(502, json={"error": {"message": "bad gateway"}})
+        return httpx.Response(200, json={
+            "id": "cmpl-2",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "qwen3-27b",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"ozet": "Nakit kredi tablosu", "is_alani": "IFRS 9", "satir_seviyesi": "kredi x gün", "anahtar_kolonlar": ["LOAN_ID"]}',
+                },
+            }],
+        })
+
+    ann_client = openai.OpenAI(
+        base_url="https://ibthink.local/v1",
+        api_key="test-key",
+        http_client=httpx.Client(transport=httpx.MockTransport(ann_handler)),
+        max_retries=0,
+    )
+    monkeypatch.setattr(kb_annotate, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(kb_annotate, "LLM_RETRIES", 3)
+    monkeypatch.setattr(kb_annotate, "_openai_client", lambda key: ann_client)
+    monkeypatch.setattr(kb_annotate._WaitWithRetryAfter, "__call__", lambda self, rs: 0.0)
+
+    card = kb_annotate.ask_llm("sys", "user", response_model=schemas.TableCardSchema)
+    assert ann_attempts["n"] == 2
+    assert card["ozet"] == "Nakit kredi tablosu"
+    assert card["anahtar_kolonlar"] == ["LOAN_ID"]
+
+
+def test_langgraph_hitl_interrupt_resume_and_mermaid(monkeypatch):
+    import agent_graph
+
+    db = _make_test_db()
+    db.execute(
+        "INSERT INTO objects(owner, name, type, comments, personal) VALUES(?,?,?,?,?)",
+        ("DWH", "CASH_LOANS", "TABLE", "Nakit krediler", 0),
+    )
+    ctx = core.Ctx(db, conn=None)
+
+    # Sırayla: bilgi_ara -> plan_onayla (interrupt!) -> cevap_ver (resume sonrası)
+    scripted = iter([
+        {
+            "role": "assistant",
+            "content": "",
+            "_finish": "tool_calls",
+            "tool_calls": [{
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "bilgi_ara", "arguments": json.dumps({"kelimeler": ["CASH_LOANS"]})},
+            }],
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "_finish": "tool_calls",
+            "tool_calls": [{
+                "id": "tc2",
+                "type": "function",
+                "function": {"name": "plan_onayla", "arguments": json.dumps({"plan": "1. DWH.CASH_LOANS sayılacak."})},
+            }],
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "_finish": "tool_calls",
+            "tool_calls": [{
+                "id": "tc3",
+                "type": "function",
+                "function": {"name": "cevap_ver", "arguments": json.dumps({
+                    "cevap": "DWH.CASH_LOANS tablosu üzerinde plan onaylandı ve işlem başarıyla tamamlandı.",
+                    "sql": "SELECT COUNT(*) FROM DWH.CASH_LOANS",
+                    "varsayimlar": "Son dönem baz alındı.",
+                })},
+            }],
+        },
+    ])
+    monkeypatch.setattr(core, "llm_chat", lambda messages, tools=None, no_think=False: next(scripted))
+
+    seen_steps = []
+    sess = agent_graph.GraphSession("Nakit kredi sayısı nedir?")
+
+    # Mermaid diyagramı kontrolü
+    mermaid = sess.mermaid()
+    assert "llm" in mermaid and "human_approval" in mermaid and "tools" in mermaid
+
+    # İlk çalıştırma: bilgi_ara çalışır, plan_onayla'da interrupt() ile durur
+    state1 = agent_graph.run_graph(sess, ctx, on_step=seen_steps.append)
+    assert state1 == "waiting"
+    assert sess.status == "waiting"
+    assert sess.pending is not None
+    assert sess.pending["kind"] == "plan_onayla"
+    assert "CASH_LOANS" in sess.pending["text"]
+    assert any(s["arac"] == "bilgi_ara" for s in sess.steps)
+
+    # Kullanıcı onayıyla Command(resume=...) üzerinden devam
+    state2 = agent_graph.resume_graph(sess, ctx, "Onaylandı, devam et.", on_step=seen_steps.append)
+    assert state2 == "done"
+    assert sess.status == "done"
+    assert sess.pending is None
+    assert sess.result is not None
+    assert "CASH_LOANS" in sess.result["sql"]
+    assert any(s["arac"] == "plan_onayla" and "Onaylandı" in s["cikti"] for s in sess.steps)
+
+
+def test_mcp_server_dwh_tools_and_ews_bridge(tmp_path):
+    import asyncio
+    import mcp_server
+
+    db = _make_test_db()
+    db.execute(
+        "INSERT INTO objects(owner, name, type, comments, num_rows, personal) VALUES(?,?,?,?,?,?)",
+        ("DWH", "LOANS", "TABLE", "Kredi bakiyeleri", 1000, 0),
+    )
+    db.execute(
+        "INSERT INTO objects(owner, name, type, comments, num_rows, personal) VALUES(?,?,?,?,?,?)",
+        ("DWH", "CUSTOMERS", "TABLE", "Müşteri ana tablosu", 500, 0),
+    )
+    db.execute(
+        "INSERT INTO columns(owner, table_name, column_id, column_name, data_type, num_distinct) VALUES(?,?,?,?,?,?)",
+        ("DWH", "LOANS", 1, "CUST_ID", "NUMBER", 500),
+    )
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS join_edges(owner1 TEXT, table1 TEXT, col1 TEXT, "
+        "owner2 TEXT, table2 TEXT, col2 TEXT, n_files INTEGER, evidence TEXT)"
+    )
+    db.execute(
+        "INSERT INTO join_edges(owner1, table1, col1, owner2, table2, col2, n_files, evidence) VALUES(?,?,?,?,?,?,?,?)",
+        ("DWH", "LOANS", "CUST_ID", "DWH", "CUSTOMERS", "CUST_ID", 12, "direct"),
+    )
+    db.execute(
+        "INSERT INTO families(owner, family, n_tables, first_table, last_table) VALUES(?,?,?,?,?)",
+        ("DWH", "PD_MAPPING_{DONEM}", 4, "PD_MAPPING_202601", "PD_MAPPING_202604"),
+    )
+    db.execute(
+        "INSERT INTO snippets(id, hash, text, kind, target) VALUES(1, 'h1', 'CREATE TABLE DWH.LOANS AS SELECT * FROM DWH.CUSTOMERS', 'ctas', 'DWH.LOANS')"
+    )
+    db.execute("INSERT INTO snippet_tables(snippet_id, owner, table_name, role) VALUES(1, 'DWH', 'CUSTOMERS', 'read')")
+    db.execute("INSERT INTO snippet_tables(snippet_id, owner, table_name, role) VALUES(1, 'DWH', 'LOANS', 'write')")
+
+    # Örnek EWS llm_dogrulama.xlsx çıktısı (köprü testi için)
+    ews_xlsx = tmp_path / "llm_dogrulama.xlsx"
+    with pd.ExcelWriter(ews_xlsx, engine="openpyxl") as w:
+        pd.DataFrame([
+            {
+                "Şirket": 101, "Şirket_Adi": "Örnek İnşaat A.Ş.", "Olay": "O1",
+                "Olay_Tipi": "konkordato_iflas", "Seviye": "CRITICAL", "Durum": "açık",
+                "Sinyale_Etkisi": "Kırmızı Alarm (Stage 3 Sinyali)", "Son_Haber": "2026-11-20",
+                "Risk_Turu": "kredi", "Tanim": "Geçici mühlet kararı verildi",
+            },
+            {
+                "Şirket": 102, "Şirket_Adi": "Beta Enerji A.Ş.", "Olay": "O1",
+                "Olay_Tipi": "dava_ceza", "Seviye": "HIGH", "Durum": "kapandı 2026-10-01",
+                "Sinyale_Etkisi": "Düşük Risk (Stage 1)", "Son_Haber": "2026-10-01",
+                "Risk_Turu": "hukuki_itibar", "Tanim": "Soruşturma takipsizlikle kapandı",
+            },
+        ]).to_excel(w, sheet_name="Olay_Defteri", index=False)
+        pd.DataFrame([
+            {
+                "Şirket": 101, "Şirket_Adi": "Örnek İnşaat A.Ş.",
+                "Birlesik_Seviye": "Kırmızı Alarm (Stage 3 Sinyali)", "Birlesik_Skor": 80.0,
+                "Risk_Matrisi": "Bilanço Kırılgan × Kritik Haber Şoku", "Toplam_Bakiye_TRY": 250_000_000.0,
+                "Haber_Sinyali": "Kırmızı Alarm (Stage 3 Sinyali)", "Haber_Skoru": 80.0,
+                "Finansal_Seviye": "Yakın İzleme (Stage 2)", "Finansal_Skor": 62.0,
+            }
+        ]).to_excel(w, sheet_name="Birlesik", index=False)
+
+    server = mcp_server.create_mcp_server(db=db, oracle_conn=None, ews_excel_path=str(ews_xlsx))
+
+    async def _verify_mcp():
+        tools = await server.list_tools()
+        tool_names = {t.name for t in tools}
+        for req in ("bilgi_ara", "tablo_karti", "join_yolu", "koken", "son_donem",
+                    "sql_calistir", "ews_olay_defteri", "ews_sirket_ozeti"):
+            assert req in tool_names, f"MCP aracı eksik: {req}"
+
+        def _text(res):
+            if hasattr(res, "content"):
+                return "\n".join(getattr(c, "text", str(c)) for c in res.content)
+            return str(res)
+
+        r_ara = _text(await server.call_tool("bilgi_ara", {"kelimeler": ["LOANS"]}))
+        assert "DWH.LOANS" in r_ara
+
+        r_kart = _text(await server.call_tool("tablo_karti", {"tablo": "DWH.LOANS"}))
+        assert "CUST_ID" in r_kart
+
+        r_join = _text(await server.call_tool("join_yolu", {"tablo1": "DWH.LOANS", "tablo2": "DWH.CUSTOMERS"}))
+        assert "DWH.LOANS.CUST_ID = DWH.CUSTOMERS.CUST_ID" in r_join
+
+        r_kok = _text(await server.call_tool("koken", {"tablo": "DWH.LOANS"}))
+        assert "DWH.CUSTOMERS" in r_kok
+
+        r_don = _text(await server.call_tool("son_donem", {"ad": "PD_MAPPING"}))
+        assert "PD_MAPPING_202604" in r_don
+
+        r_sql = _text(await server.call_tool("sql_calistir", {"sql": "SELECT 1 FROM DUAL", "amac": "test"}))
+        assert "Oracle bağlantısı yok" in r_sql
+
+        r_ews = _text(await server.call_tool("ews_olay_defteri", {"sirket": "örnek inşaat", "sadece_acik": True}))
+        assert "konkordato_iflas" in r_ews and "Beta Enerji" not in r_ews
+
+        r_ozet = _text(await server.call_tool("ews_sirket_ozeti", {"sirket": "101"}))
+        assert "Bilanço Kırılgan" in r_ozet and "konkordato_iflas" in r_ozet
+
+    asyncio.run(_verify_mcp())
+

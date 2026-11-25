@@ -5,6 +5,8 @@ ajan_app.py - Veri ambarı ajanı, Streamlit arayüzü
 Başlatma: Spyder'da baslat.py'yi F5 ile çalıştır (tarayıcıda http://localhost:8501 açılır).
 Mantık ajan_core.py'de; bu dosya sadece ekran.
 """
+from __future__ import annotations
+
 import html
 import io
 import os
@@ -15,6 +17,11 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ajan_core as core  # noqa: E402
+
+try:
+    import agent_graph as graph_engine  # noqa: E402
+except ImportError:
+    graph_engine = None
 
 st.set_page_config(page_title="Veri Ambarı Ajanı", page_icon="📊", layout="wide")
 
@@ -70,9 +77,32 @@ with st.sidebar:
     stats = get_stats()
     st.caption(f"Bilgi tabanı: {stats['tablo']:,} tablo · {stats['kullanilan']:,} kullanılan · "
                f"{stats['join']} join · {stats['kart']} kart · {stats['onayli_sorgu']} onaylı sorgu")
+    use_langgraph = False
+    if graph_engine is not None:
+        use_langgraph = st.checkbox("LangGraph akış motoru (HITL + Checkpointer)", value=True)
+        with st.expander("Akış diyagramı (Mermaid)"):
+            st.code(graph_engine.get_mermaid_diagram(), language="mermaid")
     if st.button("Yeni sohbet"):
         ss.turns = []
         st.rerun()
+
+
+def _new_session(question, extra_system=""):
+    if use_langgraph and graph_engine is not None:
+        return graph_engine.GraphSession(question, extra_system=extra_system)
+    return core.Session(question, extra_system=extra_system)
+
+
+def _run_session(sess, ctx, on_step=None):
+    if graph_engine is not None and isinstance(sess, graph_engine.GraphSession):
+        return graph_engine.run_graph(sess, ctx, on_step=on_step)
+    return core.run(sess, ctx, on_step=on_step)
+
+
+def _resume_session(sess, ctx, answer, on_step=None):
+    if graph_engine is not None and isinstance(sess, graph_engine.GraphSession):
+        return graph_engine.resume_graph(sess, ctx, answer, on_step=on_step)
+    return core.resume(sess, ctx, answer, on_step=on_step)
 
 
 # ------------------------------- Yardımcılar -------------------------------
@@ -123,7 +153,7 @@ def show_result(turn, key):
                 go = ans.strip()
             if go:
                 with st.status("Devam ediyor...", expanded=True) as box:
-                    core.resume(sess, ctx, go, on_step=live_runner(box))
+                    _resume_session(sess, ctx, go, on_step=live_runner(box))
                 st.rerun()
         return
     r = sess.result or {}
@@ -195,13 +225,13 @@ with tab_soru:
             p = prev[-1]["sess"]
             extra = (f"\n\nÖNCEKİ SORU: {p.question}\nÖNCEKİ CEVAP: {core.short((p.result or {}).get('cevap'), 600)}\n"
                      f"ÖNCEKİ SQL: {core.short((p.result or {}).get('sql'), 1500)}")
-        sess, ctx = core.Session(q, extra_system=extra), core.Ctx(db, ss.conn)
+        sess, ctx = _new_session(q, extra_system=extra), core.Ctx(db, ss.conn)
         ss.turns.append({"sess": sess, "ctx": ctx, "fb": None, "full_xlsx": None})
         with st.chat_message("user"):
             st.write(q)
         with st.chat_message("assistant"):
             with st.status("Çalışıyor...", expanded=True) as box:
-                core.run(sess, ctx, on_step=live_runner(box))
+                _run_session(sess, ctx, on_step=live_runner(box))
                 box.update(label="Tamamlandı" if sess.status == "done" else
                            ("Cevabın bekleniyor" if sess.status == "waiting" else "Hata"), state="complete")
         st.rerun()
@@ -213,11 +243,11 @@ with tab_mail:
                 "hazırlar. **Göndermeden önce sonucu ve taslağı kontrol et.**")
     mail = st.text_area("Mail metni", height=220, key="mail_text")
     if st.button("İşle", type="primary", disabled=not mail.strip()):
-        sess, ctx = core.Session(core.MAIL_PROMPT + mail), core.Ctx(db, ss.conn)
+        sess, ctx = _new_session(core.MAIL_PROMPT + mail), core.Ctx(db, ss.conn)
         sess.question = "Mail talebi: " + core.short(mail.strip().splitlines()[0] if mail.strip() else "", 80)
         ss.mail_turn = {"sess": sess, "ctx": ctx, "fb": None, "full_xlsx": None}
         with st.status("Çalışıyor...", expanded=True) as box:
-            core.run(sess, ctx, on_step=live_runner(box))
+            _run_session(sess, ctx, on_step=live_runner(box))
         st.rerun()
     if ss.mail_turn:
         st.divider()

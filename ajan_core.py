@@ -11,6 +11,8 @@ ajan_app.py (Streamlit arayüzü) bunu kullanır. İçinde:
 
 Bilgi tabanı (kb.sqlite) kb_builder / kb_profile / kb_annotate ile oluşturulur.
 """
+from __future__ import annotations
+
 import datetime as dt
 import json
 import math
@@ -23,11 +25,14 @@ import tempfile
 import threading
 import time
 
+import httpx
+import openai
 import pandas as pd
-import requests
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kb_builder as kb  # noqa: E402  (KB_DIR, PERSONAL_REGEX, family_of, read_text)
+import schemas  # noqa: E402
 
 # =============================== AYARLAR ===============================
 LLM_URL = kb.LLM_URL             # ayarlar.py'den gelir
@@ -36,6 +41,7 @@ LLM_MODEL = kb.LLM_MODEL
 LLM_VERIFY_SSL = "windows"
 LLM_TIMEOUT = 600
 LLM_MAX_TOKENS = 4096
+LLM_RETRIES = 5
 TEMPERATURE = 0.1
 
 MAX_STEPS = 30                 # bir soru için en fazla LLM adımı
@@ -58,14 +64,6 @@ _HTTP_LOCAL = threading.local()
 _DB_LOCK = threading.Lock()
 
 
-def _http():
-    """Her iş parçacığı için ayrı kalıcı requests.Session döner (thread-safe Keep-Alive)."""
-    sess = getattr(_HTTP_LOCAL, "session", None)
-    if sess is None:
-        sess = requests.Session()
-        _HTTP_LOCAL.session = sess
-    return sess
-
 _TR_FOLD_MAP = str.maketrans({
     "İ": "i", "I": "i", "ı": "i", "Ş": "s", "ş": "s", "Ğ": "g", "ğ": "g",
     "Ü": "u", "ü": "u", "Ö": "o", "ö": "o", "Ç": "c", "ç": "c",
@@ -80,9 +78,11 @@ def tr_fold(text):
 
 
 # ------------------------------- LLM -------------------------------
-def _verify():
-    if LLM_VERIFY_SSL != "windows":
-        return LLM_VERIFY_SSL
+def _verify(setting=None):
+    """LLM_VERIFY_SSL ayarını PEM dosya yolu veya bool olarak çözer (Windows sertifika deposu destekli)."""
+    val = LLM_VERIFY_SSL if setting is None else setting
+    if val != "windows":
+        return val
     if not hasattr(ssl, "enum_certificates"):
         return True
     pems = {ssl.DER_cert_to_PEM_cert(c) for s in ("ROOT", "CA")
@@ -94,6 +94,103 @@ def _verify():
 
 
 VERIFY = _verify()
+
+
+def build_httpx_verify(verify_val=None):
+    """httpx 0.28+ için SSL doğrulama nesnesi (bool veya ssl.SSLContext) üretir."""
+    v = VERIFY if verify_val is None else verify_val
+    if v == "windows":
+        v = _verify("windows")
+    if isinstance(v, bool) or isinstance(v, ssl.SSLContext):
+        return v
+    if isinstance(v, str) and v:
+        return ssl.create_default_context(cafile=v)
+    return True
+
+
+def openai_base_url(url):
+    """Tam /v1/chat/completions adresini OpenAI SDK base_url biçimine (/v1) indirger."""
+    clean = (url or "").strip().rstrip("/")
+    for suffix in ("/chat/completions", "/completions"):
+        if clean.endswith(suffix):
+            clean = clean[:-len(suffix)]
+            break
+    return clean or "https://localhost/v1"
+
+
+def _is_ssl_error(exc):
+    """İstisna zincirinde ssl.SSLError var mı kontrol eder (SSL hataları tekrar denenmez)."""
+    cur = exc
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ssl.SSLError):
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
+
+
+def _is_retryable_llm_error(exc):
+    """Yalnızca geçici ağ / 429 / 5xx hatalarında tekrar dene; 401/403/400 ve SSL'de hemen dur."""
+    if _is_ssl_error(exc):
+        return False
+    if isinstance(exc, (openai.RateLimitError, openai.APITimeoutError, openai.InternalServerError,
+                        httpx.TimeoutException)):
+        return True
+    if isinstance(exc, (openai.APIConnectionError, httpx.ConnectError)):
+        return True
+    if isinstance(exc, openai.APIStatusError):
+        return getattr(exc, "status_code", 0) in (429, 500, 502, 503, 504)
+    return False
+
+
+class _WaitWithRetryAfter(wait_exponential_jitter):
+    """429 yanıtında sunucunun Retry-After başlığına uyar; yoksa exponential backoff + jitter uygular."""
+
+    def __call__(self, retry_state):
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            ra = (resp.headers.get("retry-after") or resp.headers.get("Retry-After") or "").strip()
+            if ra.isdigit():
+                return min(float(int(ra)), 120.0)
+        return super().__call__(retry_state)
+
+
+def _http():
+    """Her iş parçacığı için ayrı kalıcı httpx.Client döner (thread-safe Keep-Alive, Windows SSL uyumlu)."""
+    verify_cfg = build_httpx_verify(VERIFY)
+    client = getattr(_HTTP_LOCAL, "http_client", None)
+    cfg_sig = (VERIFY, LLM_TIMEOUT)
+    if client is None or getattr(_HTTP_LOCAL, "http_sig", None) != cfg_sig:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        client = httpx.Client(verify=verify_cfg, timeout=httpx.Timeout(LLM_TIMEOUT, connect=30.0))
+        _HTTP_LOCAL.http_client = client
+        _HTTP_LOCAL.http_sig = cfg_sig
+        _HTTP_LOCAL.openai_client = None
+    return client
+
+
+def _openai_client(key):
+    """Her iş parçacığı için OpenAI SDK istemcisi (retry katmanı tenacity tarafından yönetilir)."""
+    base = openai_base_url(LLM_URL)
+    sig = (base, key, VERIFY, LLM_TIMEOUT)
+    client = getattr(_HTTP_LOCAL, "openai_client", None)
+    if client is None or getattr(_HTTP_LOCAL, "openai_sig", None) != sig:
+        client = openai.OpenAI(
+            base_url=base,
+            api_key=key,
+            http_client=_http(),
+            max_retries=0,
+            timeout=LLM_TIMEOUT,
+        )
+        _HTTP_LOCAL.openai_client = client
+        _HTTP_LOCAL.openai_sig = sig
+    return client
 
 
 def get_api_key():
@@ -117,44 +214,78 @@ def strip_think(text):
     return re.sub(r"(?s)^.*?</think>", "", text).strip()
 
 
+def _completion_to_msg(resp):
+    """OpenAI ChatCompletion yanıtını ajan döngüsünün beklediği mesaj sözlüğüne çevirir."""
+    choices = getattr(resp, "choices", None) or []
+    if not choices:
+        return {"role": "assistant", "content": "", "_finish": None}
+    choice = choices[0]
+    m = choice.message
+    msg = {
+        "role": getattr(m, "role", None) or "assistant",
+        "content": getattr(m, "content", None) or "",
+        "_finish": getattr(choice, "finish_reason", None),
+    }
+    tcs = getattr(m, "tool_calls", None) or []
+    if tcs:
+        msg["tool_calls"] = [
+            {
+                "id": getattr(tc, "id", None) or "",
+                "type": getattr(tc, "type", None) or "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments if tc.function.arguments is not None else "{}",
+                },
+            }
+            for tc in tcs
+        ]
+    return msg
+
+
 def llm_chat(messages, tools=None, no_think=False):
-    """Bir LLM isteği; mesaj sözlüğü döner. Geçici hatalarda bekleyip tekrar dener."""
+    """Bir LLM isteği (openai SDK + httpx + tenacity); mesaj sözlüğü döner."""
     msgs = messages
     if no_think:
         msgs = messages + [{"role": "user", "content": "Kısa ve öz devam et. /no_think"}]
-    payload = {"messages": msgs, "temperature": TEMPERATURE, "max_tokens": LLM_MAX_TOKENS, "stream": False}
-    if LLM_MODEL:
-        payload["model"] = LLM_MODEL
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
     key = re.sub(r"^bearer\s+", "", get_api_key(), flags=re.I)
     if not key:
         raise RuntimeError(f"LLM API anahtarı yok. Sol panelden anahtarı gir ({kb.API_KEY_PAGE or 'anahtar sayfası'}).")
-    headers = {"Authorization": f"Bearer {key}"}
-    last = ""
-    sess = _http()
-    for attempt in range(5):
-        try:
-            r = sess.post(LLM_URL, json=payload, headers=headers, timeout=LLM_TIMEOUT, verify=VERIFY)
-        except requests.RequestException as e:
-            last = f"{type(e).__name__}: {str(e)[:200]}"
-            time.sleep(10 * (attempt + 1))
-            continue
-        if r.status_code in (429, 500, 502, 503, 504):
-            last = f"HTTP {r.status_code}: {r.text[:200]}"
-            ra = r.headers.get("Retry-After", "")
-            time.sleep(int(ra) if ra.isdigit() else 20 * (attempt + 1))
-            continue
-        if r.status_code in (401, 403):
-            raise RuntimeError(f"IBThink anahtarı reddedildi (HTTP {r.status_code}). Sol panelden anahtarı kontrol et.")
-        if not r.ok:
-            raise RuntimeError(f"LLM HTTP {r.status_code}: {r.text[:400]}")
-        choice = (r.json().get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
-        msg["_finish"] = choice.get("finish_reason")
-        return msg
-    raise RuntimeError(f"LLM'e ulaşılamadı: {last}")
+
+    client = _openai_client(key)
+    kwargs = {
+        "model": LLM_MODEL if LLM_MODEL else openai.NOT_GIVEN,
+        "messages": msgs,
+        "temperature": TEMPERATURE,
+        "max_tokens": LLM_MAX_TOKENS,
+        "stream": False,
+    }
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+
+    retrying = Retrying(
+        stop=stop_after_attempt(max(1, LLM_RETRIES)),
+        wait=_WaitWithRetryAfter(multiplier=2.0, max=60.0, jitter=3.0),
+        retry=retry_if_exception(_is_retryable_llm_error),
+        reraise=True,
+    )
+    try:
+        resp = retrying(lambda: client.chat.completions.create(**kwargs))
+        return _completion_to_msg(resp)
+    except (openai.AuthenticationError, openai.PermissionDeniedError) as exc:
+        code = getattr(exc, "status_code", 401)
+        raise RuntimeError(f"IBThink anahtarı reddedildi (HTTP {code}). Sol panelden anahtarı kontrol et.") from exc
+    except openai.APIStatusError as exc:
+        code = getattr(exc, "status_code", "?")
+        if code in (401, 403):
+            raise RuntimeError(f"IBThink anahtarı reddedildi (HTTP {code}). Sol panelden anahtarı kontrol et.") from exc
+        if code in (429, 500, 502, 503, 504):
+            raise RuntimeError(f"LLM'e ulaşılamadı: HTTP {code}: {str(exc)[:200]}") from exc
+        raise RuntimeError(f"LLM HTTP {code}: {str(exc)[:400]}") from exc
+    except Exception as exc:
+        if _is_ssl_error(exc):
+            raise RuntimeError(f'SSL hatası (LLM_VERIFY_SSL="windows" ayarını kontrol et): {str(exc)[:300]}') from exc
+        raise RuntimeError(f"LLM'e ulaşılamadı: {type(exc).__name__}: {str(exc)[:200]}") from exc
 
 
 # ---------------------------- Bilgi tabanı ----------------------------
@@ -289,43 +420,9 @@ def export_full(conn, sql):
 
 
 # ------------------------------- Araçlar -------------------------------
-def _fn(name, desc, props, required):
-    return {"type": "function", "function": {"name": name, "description": desc,
-            "parameters": {"type": "object", "properties": props, "required": required}}}
-
-
-S = {"type": "string"}
-TOOLS = [
-    _fn("bilgi_ara", "Bilgi tabanında arar: ilgili tablolar (kartları ve kullanım sayılarıyla), ekibin onayladığı "
-        "sorgular, ekibin benzer geçmiş sorguları ve dönemsel tablo aileleri. İlk adım budur. Türkçe ve İngilizce "
-        "eş anlamlıları ve kısaltmaları da ver (ör. gecikme, delay, dpd, dlq).",
-        {"kelimeler": {"type": "array", "items": S}}, ["kelimeler"]),
-    _fn("tablo_karti", "Bir tablonun kartı: ne tuttuğu, satır seviyesi, kolonlar (tip, aralık, kod değerleri), "
-        "doğrulanmış join'leri ve tuzakları. SQL yazmadan önce kullanacağın her tablo için çağır.",
-        {"tablo": {"type": "string", "description": "OWNER.TABLO"}}, ["tablo"]),
-    _fn("join_yolu", "İki tablo arasındaki doğrulanmış join yolunu (ekibin sorgularından) verir. Join'i ASLA "
-        "tahmin etme, bu aracı kullan.", {"tablo1": S, "tablo2": S}, ["tablo1", "tablo2"]),
-    _fn("koken", "Tablonun hangi tablolardan üretildiğini ve hangi tabloları beslediğini verir.", {"tablo": S},
-        ["tablo"]),
-    _fn("son_donem", "Dönemsel tablo ailesinin (ör. PD_MAPPING, SME_WL) en yeni tablosunu ve dönemlerini verir.",
-        {"ad": S}, ["ad"]),
-    _fn("sql_calistir", "Oracle'da SELECT sorgusu çalıştırır, satır sayısını ve ilk satırları döner. Ağır sorguda "
-        "önce uyarı verir; kullanıcı onaylarsa zorla=true ile tekrar çağır.",
-        {"sql": S, "amac": S, "zorla": {"type": "boolean"}}, ["sql", "amac"]),
-    _fn("tekillik_kontrol", "Join'li sorgunun satırları çoğaltıp çoğaltmadığını kontrol eder: COUNT(*) ile anahtar "
-        "kolonların COUNT(DISTINCT) değerini karşılaştırır.",
-        {"sql": S, "anahtar_kolonlar": {"type": "array", "items": S}}, ["sql", "anahtar_kolonlar"]),
-    _fn("plan_onayla", "Karmaşık sorularda (2+ tablo, çok adımlı hesap, dönem karşılaştırması) SQL yazmadan önce "
-        "planı kullanıcıya onaylatır. Kullanıcının cevabını döner.", {"plan": S}, ["plan"]),
-    _fn("kullaniciya_sor", "Kullanıcıya soru sorar ve cevabını döner: tablo seçimini onaylatmak, belirsizliği "
-        "gidermek, ağır sorgu için izin almak.", {"soru": S}, ["soru"]),
-    _fn("tablo_olustur", "SADECE kullanıcı açıkça tablo oluşturmanı isterse: verilen SELECT'in sonucuyla "
-        "kullanıcının KENDİ şemasında yeni bir tablo oluşturur (CREATE TABLE ... AS SELECT). Var olan tablonun "
-        "üzerine yazmaz. Önce SELECT'i sql_calistir ile dene. Kullanıcı ekranda onaylayınca çalışır.",
-        {"tablo_adi": S, "sql": S, "aciklama": S, "zorla": {"type": "boolean"}}, ["tablo_adi", "sql"]),
-    _fn("cevap_ver", "İş bitince çağrılır. Kısa Türkçe cevap, kullanılan nihai SQL (yoksa boş) ve varsayımlar.",
-        {"cevap": S, "sql": S, "varsayimlar": S}, ["cevap"]),
-]
+# Tüm araç giriş/çıkış şemaları schemas.py içinde Pydantic v2 modelleriyle tanımlanır ve
+# OpenAI TOOLS listesi model_json_schema() üzerinden otomatik üretilir.
+TOOLS = schemas.build_openai_tools()
 
 
 class Ctx:
@@ -709,12 +806,12 @@ def _process_calls(sess, ctx, calls, on_step, auto_approve):
     """Araç çağrılarını sırayla çalıştırır. Onay gerektirende durur (pending) ve 'waiting' döner."""
     for i, c in enumerate(calls):
         name = c["function"]["name"]
-        try:
-            args = json.loads(c["function"].get("arguments") or "{}")
-        except json.JSONDecodeError:
-            msg = "Argümanlar okunamadı (çıktı yarıda kesilmiş). Bu aracı daha KISA argümanlarla tekrar çağır."
-            sess.messages.append({"role": "tool", "tool_call_id": c["id"], "content": msg})
-            sess.steps.append({"arac": name, "girdi": short(c["function"].get("arguments"), 300), "cikti": msg})
+        args, err_msg = schemas.validate_tool_args(name, c["function"].get("arguments"))
+        if err_msg is not None:
+            sess.messages.append({"role": "tool", "tool_call_id": c["id"], "content": err_msg})
+            sess.steps.append({"arac": name, "girdi": short(c["function"].get("arguments"), 300), "cikti": err_msg})
+            if on_step:
+                on_step(sess.steps[-1])
             continue
         if name == "cevap_ver" and len(str(args.get("cevap") or "").strip()) < 15:
             msg = ("cevap alanı boş ya da yarım geldi. cevap_ver'i tekrar çağır: 'cevap' alanına 3-10 satırlık tam bir "

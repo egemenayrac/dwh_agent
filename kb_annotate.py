@@ -18,6 +18,8 @@ Kaldığı yerden devam eder; girdisi değişmeyen kart tekrar yazılmaz. Gece �
 
 Kurulum: kb_builder.py ile aynı klasörde olmalı (onun ayarlarını ve fonksiyonlarını kullanır).
 """
+from __future__ import annotations
+
 import datetime as dt
 import hashlib
 import json
@@ -30,10 +32,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
+import httpx
+import openai
+from pydantic import ValidationError
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kb_builder as kb  # noqa: E402  (KB_DIR, dosya okuma ve SQL çıkarma fonksiyonları)
+import schemas  # noqa: E402
 
 # =============================== AYARLAR ===============================
 LLM_URL = kb.LLM_URL             # ayarlar.py'den gelir
@@ -42,6 +48,7 @@ LLM_MODEL = kb.LLM_MODEL
 LLM_VERIFY_SSL = "windows"
 LLM_TIMEOUT = 600
 LLM_MAX_TOKENS = 4096        # IBThink üst sınırı 4096 (düşünme + cevap birlikte)
+LLM_RETRIES = 5              # Geçici ağ / 429 / 5xx hatalarında üst sınır
 NO_THINK = True              # Qwen'in uzun "düşünme"sini kapatır; token bütçesi JSON'a kalır
 LLM_WORKERS = 1              # IBThink kişisel anahtar paralel limiti 1; uygulama anahtarı alınırsa artırılabilir
 
@@ -84,13 +91,97 @@ FACTS = ""
 _HTTP_LOCAL = threading.local()
 
 
+def build_httpx_verify(verify_val=None):
+    """httpx 0.28+ için SSL doğrulama nesnesi (bool veya ssl.SSLContext) üretir."""
+    v = VERIFY if verify_val is None else verify_val
+    if v == "windows":
+        v = resolve_ssl_verify("windows")
+    if isinstance(v, bool) or isinstance(v, ssl.SSLContext):
+        return v
+    if isinstance(v, str) and v:
+        return ssl.create_default_context(cafile=v)
+    return True
+
+
+def openai_base_url(url):
+    """Tam /v1/chat/completions adresini OpenAI SDK base_url biçimine (/v1) indirger."""
+    clean = (url or "").strip().rstrip("/")
+    for suffix in ("/chat/completions", "/completions"):
+        if clean.endswith(suffix):
+            clean = clean[:-len(suffix)]
+            break
+    return clean or "https://localhost/v1"
+
+
+def _is_ssl_error(exc):
+    cur = exc
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ssl.SSLError):
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
+
+
+def _is_retryable_llm_error(exc):
+    if _is_ssl_error(exc):
+        return False
+    if isinstance(exc, (openai.RateLimitError, openai.APITimeoutError, openai.InternalServerError,
+                        openai.APIConnectionError, httpx.TimeoutException, httpx.ConnectError)):
+        return True
+    if isinstance(exc, openai.APIStatusError):
+        return getattr(exc, "status_code", 0) in (429, 500, 502, 503, 504)
+    return False
+
+
+class _WaitWithRetryAfter(wait_exponential_jitter):
+    """429 yanıtında Retry-After başlığına uyar; yoksa exponential backoff + jitter uygular."""
+
+    def __call__(self, retry_state):
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            ra = (resp.headers.get("retry-after") or resp.headers.get("Retry-After") or "").strip()
+            if ra.isdigit():
+                return min(float(int(ra)), 120.0)
+        return super().__call__(retry_state)
+
+
 def _http():
-    """Her iş parçacığı için ayrı kalıcı requests.Session döner (thread-safe Keep-Alive)."""
-    sess = getattr(_HTTP_LOCAL, "session", None)
-    if sess is None:
-        sess = requests.Session()
-        _HTTP_LOCAL.session = sess
-    return sess
+    """Her iş parçacığı için ayrı kalıcı httpx.Client döner (thread-safe Keep-Alive, Windows SSL uyumlu)."""
+    verify_cfg = build_httpx_verify(VERIFY)
+    client = getattr(_HTTP_LOCAL, "http_client", None)
+    cfg_sig = (VERIFY, LLM_TIMEOUT)
+    if client is None or getattr(_HTTP_LOCAL, "http_sig", None) != cfg_sig:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        client = httpx.Client(verify=verify_cfg, timeout=httpx.Timeout(LLM_TIMEOUT, connect=30.0))
+        _HTTP_LOCAL.http_client = client
+        _HTTP_LOCAL.http_sig = cfg_sig
+        _HTTP_LOCAL.openai_client = None
+    return client
+
+
+def _openai_client(key):
+    """Her iş parçacığı için OpenAI SDK istemcisi (retry tenacity ile yönetilir)."""
+    base = openai_base_url(LLM_URL)
+    sig = (base, key, VERIFY, LLM_TIMEOUT)
+    client = getattr(_HTTP_LOCAL, "openai_client", None)
+    if client is None or getattr(_HTTP_LOCAL, "openai_sig", None) != sig:
+        client = openai.OpenAI(
+            base_url=base,
+            api_key=key or "not-required",
+            http_client=_http(),
+            max_retries=0,
+            timeout=LLM_TIMEOUT,
+        )
+        _HTTP_LOCAL.openai_client = client
+        _HTTP_LOCAL.openai_sig = sig
+    return client
 
 
 def get_api_key():
@@ -112,41 +203,54 @@ def parse_json(text):
     return json.loads(text[start:end + 1])
 
 
-def ask_llm(system, user):
-    """JSON sözlük döndürür; bozuk JSON'da bir kez düzeltme ister, geçici hatalarda bekleyip tekrar dener."""
+def ask_llm(system, user, response_model=None):
+    """JSON sözlük döndürür (openai SDK + httpx + tenacity); bozuk JSON/şemada düzeltme ister."""
     key = get_api_key()
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
     if NO_THINK:
         user += "\n\n/no_think"
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    client = _openai_client(key)
+    retrying = Retrying(
+        stop=stop_after_attempt(max(1, LLM_RETRIES)),
+        wait=_WaitWithRetryAfter(multiplier=2.0, max=60.0, jitter=3.0),
+        retry=retry_if_exception(_is_retryable_llm_error),
+        reraise=True,
+    )
     last = ""
-    sess = _http()
-    for attempt in range(5):
-        payload = {"messages": messages, "temperature": 0.0, "max_tokens": LLM_MAX_TOKENS, "stream": False}
-        if LLM_MODEL:
-            payload["model"] = LLM_MODEL
+    for _ in range(3):
+        kwargs = {
+            "model": LLM_MODEL if LLM_MODEL else openai.NOT_GIVEN,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": LLM_MAX_TOKENS,
+            "stream": False,
+        }
         try:
-            r = sess.post(LLM_URL, json=payload, headers=headers, timeout=LLM_TIMEOUT, verify=VERIFY)
-        except requests.RequestException as e:
-            last = f"{type(e).__name__}: {str(e)[:150]}"
-            time.sleep(15 * (attempt + 1))
-            continue
-        if r.status_code in (429, 500, 502, 503, 504):
-            last = f"HTTP {r.status_code}"
-            ra = r.headers.get("Retry-After", "")
-            time.sleep(int(ra) if ra.isdigit() else 30 * (attempt + 1))
-            continue
-        if not r.ok:
-            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-        choice = (r.json().get("choices") or [{}])[0]
-        content = (choice.get("message") or {}).get("content") or ""
-        if choice.get("finish_reason") == "length" and "</think>" not in content and "<think>" in content:
+            resp = retrying(lambda: client.chat.completions.create(**kwargs))
+        except (openai.AuthenticationError, openai.PermissionDeniedError) as exc:
+            code = getattr(exc, "status_code", 401)
+            raise RuntimeError(f"HTTP {code}: IBThink anahtarı reddedildi.") from exc
+        except openai.APIStatusError as exc:
+            raise RuntimeError(f"HTTP {getattr(exc, 'status_code', '?')}: {str(exc)[:300]}") from exc
+        except Exception as exc:
+            if _is_ssl_error(exc):
+                raise RuntimeError(f'SSL hatası (LLM_VERIFY_SSL="windows" kontrol edin): {str(exc)[:250]}') from exc
+            raise RuntimeError(f"{type(exc).__name__}: {str(exc)[:200]}") from exc
+
+        choices = getattr(resp, "choices", None) or []
+        choice = choices[0] if choices else None
+        content = (getattr(getattr(choice, "message", None), "content", None) or "") if choice else ""
+        finish_reason = getattr(choice, "finish_reason", None) if choice else None
+        if finish_reason == "length" and "</think>" not in content and "<think>" in content:
             last = "cevap düşünme aşamasında token sınırına takıldı"
             continue
         try:
-            return parse_json(content)
-        except (ValueError, json.JSONDecodeError) as e:
-            last = f"JSON okunamadı ({e}); finish_reason={choice.get('finish_reason')}"
+            parsed = parse_json(content)
+            if response_model is not None:
+                parsed = response_model.model_validate(parsed).model_dump()
+            return parsed
+        except (ValueError, json.JSONDecodeError, ValidationError) as e:
+            last = f"JSON okunamadı ({e}); finish_reason={finish_reason}"
             messages = messages[:2] + [{"role": "assistant", "content": content[-4000:]},
                                        {"role": "user", "content": "Cevabın geçerli JSON değildi. İstenen şemada, "
                                                                    "SADECE tek bir JSON nesnesi döndür."}]
@@ -266,7 +370,7 @@ def run_files(db, deadline):
         path, mtime, info, key = item
         user = (f"Dosya: {path}\nSon değişiklik: {mtime}\n\nBu dosyanın kullandığı/oluşturduğu tablolar "
                 f"(katalog açıklamalarıyla):\n{info or '-'}\n\n=== DOSYA İÇERİĞİ ===\n{file_text_for_llm(path)}")
-        return ask_llm(FILE_SYSTEM + FACTS, user)
+        return ask_llm(FILE_SYSTEM + FACTS, user, response_model=schemas.FileCardSchema)
 
     _run(db, todo, work, lambda item, card, status: db.execute(
         "INSERT OR REPLACE INTO file_cards VALUES(?,?,?,?,?)",
@@ -413,7 +517,8 @@ def run_tables(db, deadline):
     if LIMIT_TABLES:
         todo = todo[:LIMIT_TABLES]
     print(f"Tablo kartı: {len(jobs)} tablo, {len(todo)} tanesi yazılacak")
-    _run(db, todo, lambda item: ask_llm(TABLE_SYSTEM + FACTS, item[2]), lambda item, card, status: db.execute(
+    _run(db, todo, lambda item: ask_llm(TABLE_SYSTEM + FACTS, item[2], response_model=schemas.TableCardSchema),
+         lambda item, card, status: db.execute(
         "INSERT OR REPLACE INTO table_cards VALUES(?,?,?,?,?,?)",
         (item[0], item[1], item[3], json.dumps(card, ensure_ascii=False), status, kb.now())), deadline, "tablo")
 
